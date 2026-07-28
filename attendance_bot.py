@@ -24,6 +24,7 @@ import json
 import datetime as dt
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord.ext import tasks
 
@@ -55,6 +56,12 @@ EXCLUDE_NAME_CONTAINS     = ["join to create"]
 EXCLUDE_CATEGORY_CONTAINS = ["statdock"]
 STATE_FILE   = "attendance_state.json"
 HISTORY_FILE = "attendance_history.json"
+
+# --- Wins feed: auto-post new sales from the Supabase deals table to #wins ---
+WINS_CHANNEL_ID = 1531689406832836719
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://pgxoyhlcbjuoucvubsmy.supabase.co").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")   # tracker's Supabase anon key (set in Railway)
+WINS_STATE_FILE = "wins_state.json"
 
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -381,6 +388,58 @@ async def on_interaction(interaction):
         except Exception: await interaction.response.send_message(txt, ephemeral=True)
 
 
+# ---- wins feed (Supabase deals -> #wins) ---------------------------------
+async def fetch_recent_deals(limit=50):
+    url = f"{SUPABASE_URL}/rest/v1/deals"
+    headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
+    params = {"select": "*", "order": "posted_at.desc", "limit": str(limit)}
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, params=params, headers=headers,
+                         timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                print("deals fetch", r.status, (await r.text())[:200]); return []
+            return await r.json()
+
+def fmt_deal(d):
+    agent = d.get("agent") or "Someone"
+    parts = []
+    if d.get("apps"):
+        n = d["apps"]; parts.append(f"{n} app{'s' if n != 1 else ''}")
+    if d.get("ap"):
+        try: parts.append(f"${int(float(d['ap'])):,} AP")
+        except Exception: parts.append(f"{d['ap']} AP")
+    elif d.get("gross"):
+        try: parts.append(f"${int(float(d['gross'])):,}")
+        except Exception: pass
+    line = f"💰 **{agent}** just closed"
+    if parts: line += " — " + " · ".join(parts)
+    if d.get("carrier"): line += f" ({d['carrier']})"
+    return line + " 🔥"
+
+@tasks.loop(seconds=90)
+async def wins_poller():
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(WINS_CHANNEL_ID)
+    if not ch: return
+    try:
+        deals = await fetch_recent_deals(50)
+    except Exception as e:
+        print("wins poll error", e); return
+    data = load_json(WINS_STATE_FILE, {"seen": [], "init": False})
+    seen = set(str(x) for x in data.get("seen", []))
+    init = data.get("init", False)
+    order = sorted(deals, key=lambda d: d.get("posted_at") or "")  # oldest first
+    for d in order:
+        did = str(d.get("id"))
+        if did in seen: continue
+        if init:
+            try: await ch.send(fmt_deal(d))
+            except Exception as e: print("wins send", e)
+        seen.add(did)
+    seen_list = list(seen)[-1000:]
+    save_json(WINS_STATE_FILE, {"seen": seen_list, "init": True})
+
+
 # ---- scheduler ------------------------------------------------------------
 _last_daily = None
 _last_weekly = None
@@ -390,6 +449,7 @@ async def on_ready():
     print(f"Logged in as {client.user}.")
     load_state(); await ensure_start_message()
     if not scheduler.is_running(): scheduler.start()
+    if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
 
 @tasks.loop(seconds=30)
 async def scheduler():
