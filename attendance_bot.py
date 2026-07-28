@@ -58,10 +58,17 @@ STATE_FILE   = "attendance_state.json"
 HISTORY_FILE = "attendance_history.json"
 
 # --- Wins feed: auto-post new sales from the Supabase deals table to #wins ---
-WINS_CHANNEL_ID = 1531689406832836719
+WINS_CHANNEL_ID = 1531689406832836719           # #deals
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://pgxoyhlcbjuoucvubsmy.supabase.co").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")   # tracker's Supabase anon key (set in Railway)
 WINS_STATE_FILE = "wins_state.json"
+
+# --- Recognition hub (#recognition — the repurposed #weekly-report channel) ---
+RECOGNITION_CH_ID = 1531496475379499222
+WEEKLY_APPS_GOAL = 150         # team's weekly apps goal — change to your real number
+MILESTONE_DEALS = [25, 50, 75, 100, 150, 200, 300]
+MILESTONE_AP    = [25000, 50000, 100000, 150000, 200000, 300000]
+MILESTONE_FILE  = "milestone_state.json"
 
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -297,24 +304,44 @@ def aggregate_week():
                     if r.get("left_early"): a["early"] += 1
     return agg
 
+def bar(pct, width=14):
+    pct = max(0.0, min(1.0, pct))
+    f = int(round(pct * width))
+    return "█" * f + "░" * (width - f)
+
 async def post_weekly():
     agg = aggregate_week()
-    if not agg: return
     rows = list(agg.values())
-    pub = client.get_channel(WEEKLY_PUBLIC_CH_ID)
-    if pub:
-        top = sorted(rows, key=lambda r: r["hours"], reverse=True)[:5]
-        perfect = sorted([r for r in rows if r["scheduled"] and r["present"] == r["scheduled"]
-                          and r["late"] == 0 and r["early"] == 0], key=lambda r: r["hours"], reverse=True)
-        e = discord.Embed(title="🏆 Weekly Leaderboard",
+    deals = []
+    if SUPABASE_KEY:
+        start = (now_pt() - dt.timedelta(days=7)).astimezone(dt.timezone.utc).isoformat()
+        try: deals = await fetch_deals_since(start)
+        except Exception as e: print("recog deals", e)
+    ds = summarize_deals(deals)
+
+    # ---- PUBLIC recognition -> #recognition ----
+    rec = client.get_channel(RECOGNITION_CH_ID)
+    if rec:
+        e = discord.Embed(title="🏅 Weekly Recognition",
             description=now_pt().strftime("Week ending %A, %b %-d"), color=0xF1C40F)
-        e.add_field(name="🔥 Top Hours",
-            value="\n".join(f"**{i+1}.** {r['name']} — {r['hours']:.1f}h" for i, r in enumerate(top)) or "—", inline=False)
-        e.add_field(name="🎯 Perfect Week (on time + full, every scheduled day)",
-            value="\n".join(f"• {r['name']} — {r['hours']:.1f}h" for r in perfect) or "Nobody yet — be the first.", inline=False)
-        e.set_footer(text="Excel Financial · AFK not counted")
-        try: await pub.send(embed=e)
-        except Exception as ex: print("weekly pub", ex)
+        pct = (ds["apps"] / WEEKLY_APPS_GOAL) if WEEKLY_APPS_GOAL else 0
+        e.add_field(name="🎯 Team Goal",
+            value=f"**{ds['apps']} / {WEEKLY_APPS_GOAL} apps**\n`{bar(pct)}` {pct*100:.0f}%", inline=False)
+        e.add_field(name=f"🏆 Top Closers — {ds['count']} deals · ${int(ds['ap']):,} AP",
+            value=leaderboard_lines(ds["by"], 5), inline=False)
+        top = sorted(rows, key=lambda r: r["hours"], reverse=True)[:5]
+        e.add_field(name="⏱️ Top Hours",
+            value="\n".join(f"**{i+1}.** {r['name']} — {r['hours']:.1f}h" for i, r in enumerate(top)) or "—",
+            inline=False)
+        deal_names = set(str(n).strip().lower() for n in ds["by"])
+        warm = [r["name"] for r in rows if r["hours"] >= 5 and r["name"].strip().lower() not in deal_names]
+        if warm:
+            e.add_field(name="🪑 On the clock, no deals yet",
+                value="\n".join("• " + n for n in warm[:10]), inline=False)
+        e.set_footer(text="Excel Financial · hours exclude AFK")
+        try: await rec.send(embed=e)
+        except Exception as ex: print("recognition", ex)
+
     priv = client.get_channel(LOG_CHANNEL_ID)
     if priv:
         def consist(r): return (r["present"] - r["late"] - r["early"]) / r["scheduled"] if r["scheduled"] else 0
@@ -429,15 +456,108 @@ async def wins_poller():
     seen = set(str(x) for x in data.get("seen", []))
     init = data.get("init", False)
     order = sorted(deals, key=lambda d: d.get("posted_at") or "")  # oldest first
+    new_posted = False
     for d in order:
         did = str(d.get("id"))
         if did in seen: continue
         if init:
-            try: await ch.send(fmt_deal(d))
+            try: await ch.send(fmt_deal(d)); new_posted = True
             except Exception as e: print("wins send", e)
         seen.add(did)
     seen_list = list(seen)[-1000:]
     save_json(WINS_STATE_FILE, {"seen": seen_list, "init": True})
+    if new_posted:
+        await check_milestones()
+
+async def check_milestones():
+    rec = client.get_channel(RECOGNITION_CH_ID)
+    if not rec: return
+    start = (now_pt() - dt.timedelta(days=7)).astimezone(dt.timezone.utc).isoformat()
+    try: deals = await fetch_deals_since(start)
+    except Exception: return
+    s = summarize_deals(deals)
+    wk = now_pt().strftime("%Y-W%W")
+    st = load_json(MILESTONE_FILE, {})
+    hit = st.get(wk, {"deals": [], "ap": []})
+    changed = False
+    for m in MILESTONE_DEALS:
+        if s["count"] >= m and m not in hit["deals"]:
+            hit["deals"].append(m); changed = True
+            try: await rec.send(f"🎉 **{m} deals** closed this week and climbing — let's go! 🔥")
+            except Exception as e: print("milestone", e)
+    for m in MILESTONE_AP:
+        if s["ap"] >= m and m not in hit["ap"]:
+            hit["ap"].append(m); changed = True
+            try: await rec.send(f"💥 **${m:,} AP** this week! Momentum is real. 🚀")
+            except Exception as e: print("milestone", e)
+    if changed:
+        st[wk] = hit; save_json(MILESTONE_FILE, st)
+
+
+# ---- deals totals (daily + weekly summary in #deals) ----------------------
+async def fetch_deals_since(iso):
+    url = f"{SUPABASE_URL}/rest/v1/deals"
+    headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
+    params = {"select": "*", "posted_at": f"gte.{iso}", "order": "posted_at.asc"}
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, params=params, headers=headers,
+                         timeout=aiohttp.ClientTimeout(total=25)) as r:
+            if r.status != 200:
+                print("deals summary fetch", r.status, (await r.text())[:200]); return []
+            return await r.json()
+
+def _num(x):
+    try: return float(x)
+    except Exception: return 0.0
+
+def summarize_deals(deals):
+    by = {}
+    for d in deals:
+        a = d.get("agent") or "Unknown"
+        e = by.setdefault(a, {"deals": 0, "apps": 0, "ap": 0.0})
+        e["deals"] += 1; e["apps"] += int(_num(d.get("apps"))); e["ap"] += _num(d.get("ap"))
+    return {"count": len(deals),
+            "apps": sum(int(_num(d.get("apps"))) for d in deals),
+            "ap": sum(_num(d.get("ap")) for d in deals), "by": by}
+
+def leaderboard_lines(by, n=5):
+    rows = sorted(by.items(), key=lambda kv: kv[1]["ap"], reverse=True)[:n]
+    medals = ["🥇", "🥈", "🥉"]
+    out = []
+    for i, (name, s) in enumerate(rows):
+        tag = medals[i] if i < 3 else f"**{i+1}.**"
+        out.append(f"{tag} {name} — {s['deals']} deal{'s' if s['deals'] != 1 else ''} · ${int(s['ap']):,}")
+    return "\n".join(out) or "—"
+
+async def post_deals_daily():
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(WINS_CHANNEL_ID)
+    if not ch: return
+    start = now_pt().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc).isoformat()
+    try: deals = await fetch_deals_since(start)
+    except Exception as e: print("deals daily", e); return
+    s = summarize_deals(deals)
+    e = discord.Embed(title=f"📊 Deals Today — {now_pt().strftime('%A, %b %-d')}",
+        description=f"**{s['count']}** deals · **{s['apps']}** apps · **${int(s['ap']):,} AP**",
+        color=0xF1C40F)
+    if s["by"]: e.add_field(name="Top closers", value=leaderboard_lines(s["by"], 5), inline=False)
+    try: await ch.send(embed=e)
+    except Exception as ex: print("deals daily send", ex)
+
+async def post_deals_weekly():
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(WINS_CHANNEL_ID)
+    if not ch: return
+    start = (now_pt() - dt.timedelta(days=7)).astimezone(dt.timezone.utc).isoformat()
+    try: deals = await fetch_deals_since(start)
+    except Exception as e: print("deals weekly", e); return
+    s = summarize_deals(deals)
+    e = discord.Embed(title=f"🏆 Deals This Week — ending {now_pt().strftime('%A, %b %-d')}",
+        description=f"**{s['count']}** deals · **{s['apps']}** apps · **${int(s['ap']):,} AP**",
+        color=0xE67E22)
+    if s["by"]: e.add_field(name="🔥 Top Closers", value=leaderboard_lines(s["by"], 10), inline=False)
+    try: await ch.send(embed=e)
+    except Exception as ex: print("deals weekly send", ex)
 
 
 # ---- scheduler ------------------------------------------------------------
@@ -456,9 +576,9 @@ async def scheduler():
     global _last_daily, _last_weekly
     n = now_pt(); ensure_today()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
-        _last_daily = n.date(); await post_daily_report()
+        _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
-        _last_weekly = n.date(); await post_weekly()
+        _last_weekly = n.date(); await post_weekly()   # recognition now includes weekly deals
 
 
 if __name__ == "__main__":
