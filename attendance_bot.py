@@ -1090,7 +1090,7 @@ def _submitted_ap_by_agent(state, mkey):
         if total: out[str(agent)] = total
     return out
 
-def _team_board_embed(state, prod, month_label, *, kind):
+def _team_board_embed(state, prod, month_label, *, kind, deal_count=None):
     metric = "IP" if kind == "ip" else "AP"
     team = _team_rollup(state, prod)
     # --- Manager Scoreboard: managers whose DOWNLINE has written business (top 10) ---
@@ -1103,13 +1103,19 @@ def _team_board_embed(state, prod, month_label, *, kind):
         mrows.append((mgr, tv))
     mrows.sort(key=lambda r: r[1], reverse=True)
     mrows = mrows[:10]
-    # --- Individual Scoreboard: top 10 by personal production ---
-    irows = [(a, float(v or 0)) for a, v in prod.items()
-             if str(a).lower() not in IP_EXCLUDE and float(v or 0) > 0]
+    # --- Individual Scoreboard: top 10 by personal production (owner INCLUDED here) ---
+    irows = [(a, float(v or 0)) for a, v in prod.items() if float(v or 0) > 0]
     irows.sort(key=lambda r: r[1], reverse=True)
     irows = irows[:10]
     if not mrows and not irows: return None
     blocks = []
+    # --- Excel Financial monthly total across the whole floor ---
+    floor_total = sum(float(v or 0) for v in prod.values())
+    if kind == "ip":
+        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${int(round(floor_total)):,} issued IP**")
+    else:
+        dtxt = f" · **{deal_count} deals**" if deal_count else ""
+        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${int(round(floor_total)):,} AP**{dtxt}")
     if mrows:
         head = f"{'#':<3}{'Manager':<20}{'Team '+metric:>9}"
         L = [head, "─" * len(head)]
@@ -1139,7 +1145,9 @@ async def refresh_team_ap_board():
     if not state: return
     mkey = _live_month_key(); label = _month_label(mkey)
     prod = _submitted_ap_by_agent(state, mkey)   # canonical names from the tracker -> matches it exactly
-    e = _team_board_embed(state, prod, label, kind="ap")
+    mdeals = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
+    deal_count = sum(len(chips or []) for chips in mdeals.values())
+    e = _team_board_embed(state, prod, label, kind="ap", deal_count=deal_count)
     if not e: return
     async for m in ch.history(limit=25):
         if m.author == client.user and m.embeds and (m.embeds[0].title or "").startswith("🏆 Team"):
