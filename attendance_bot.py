@@ -435,41 +435,94 @@ def trailing_counts(days=7):
     return counts
 
 
-# ---- daily report ---------------------------------------------------------
+# ---- daily report (visual card — every person, color-coded) ---------------
+DAILY_STATUS_COLORS = {"ontime": (46, 204, 113), "late": (241, 196, 15),
+                       "early": (230, 126, 34), "late+early": (231, 76, 60),
+                       "noshow": (231, 76, 60)}
+DAILY_STATUS_LABEL  = {"ontime": "ON TIME", "late": "LATE", "early": "LEFT EARLY",
+                       "late+early": "LATE + LEFT EARLY", "noshow": "NO-SHOW"}
+
+def render_daily_card(day_label, start_label, end_label, rows):
+    """rows = [{name, status, detail, hours, cam}] — one row per person, color-coded."""
+    if not HAVE_PIL or not rows: return None
+    W = 1000; row_h = 58; top = 190
+    H = top + len(rows) * row_h + 70
+    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
+    tx = 60
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo = Image.open(LOGO_FILE).convert("RGBA").resize((110, 110), Image.LANCZOS)
+            img.paste(logo, (46, 36), logo); tx = 190
+        except Exception: pass
+    d.text((tx, 46), "DAILY ATTENDANCE", font=_card_font(42, True), fill=CARD_GOLD)
+    d.text((tx, 104), f"{day_label} · {start_label} – {end_label} PT", font=_card_font(24), fill=CARD_WHITE)
+    y = top
+    for r in rows:
+        col = DAILY_STATUS_COLORS.get(r["status"], CARD_DIM)
+        d.rectangle([26, y - 6, 32, y + row_h - 18], fill=col)          # status color bar
+        d.ellipse([48, y + 8, 64, y + 24], fill=col)                    # status dot
+        d.text((84, y), r["name"][:22], font=_card_font(28, True), fill=CARD_WHITE)
+        label = DAILY_STATUS_LABEL.get(r["status"], "")
+        if r.get("detail"): label += f"  ·  {r['detail']}"
+        d.text((84, y + 30), label, font=_card_font(17), fill=col)
+        right = f"{r['hours']:.1f}h · cam {r['cam']*100:.0f}%" if r["hours"] > 0 else "—"
+        vf = _card_font(22); vw = d.textlength(right, font=vf)
+        d.text((W - 56 - vw, y + 6), right, font=vf, fill=CARD_WHITE if r["hours"] > 0 else CARD_DIM)
+        d.line([26, y + row_h - 12, W - 26, y + row_h - 12], fill=CARD_LINE, width=1)
+        y += row_h
+    ok = sum(1 for r in rows if r["status"] == "ontime")
+    d.text((56, H - 52), f"{ok}/{len(rows)} clean days · EXCEL FINANCIAL · AFK not counted",
+           font=_card_font(19), fill=CARD_DIM)
+    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
+    return buf
+
 async def post_daily_report():
     ch = client.get_channel(LOG_CHANNEL_ID); start = scheduled_start_today()
     if not ch or start is None: return
     guild = client.get_guild(GUILD_ID)
-    late, early, full, absent, lowcam, violators = [], [], [], [], [], []
+    end_t = end_today() or dt.time(18, 0)
+    rows = []
     for mid, rec in today.items():
         secs = live_seconds(rec); le = is_early_leave(rec); cp = camera_pct(rec)
-        if rec["late"]: late.append(f"• {rec['name']} — arrived **{fmt(rec['first_join'])}**")
-        if le:          early.append(f"• {rec['name']} — left **{fmt(rec['last_leave'])}** ({hstr(secs)})")
-        if not rec["late"] and not le: full.append(f"• {rec['name']} — {hstr(secs)}")
-        if secs >= CAMERA_MIN_MINS*60 and cp < CAMERA_MIN_PCT:
-            lowcam.append(f"• {rec['name']} — camera on **{cp*100:.0f}%** of {hstr(secs)}")
-        pts = (1 if rec["late"] else 0) + (1 if le else 0)
-        if pts: violators.append((pts, rec["name"]))
+        if rec["late"] and le: status = "late+early"
+        elif rec["late"]:      status = "late"
+        elif le:               status = "early"
+        else:                  status = "ontime"
+        bits = []
+        if rec["late"] and rec.get("first_join"): bits.append(f"in {fmt(rec['first_join'])}")
+        if le and rec.get("last_leave"):          bits.append(f"out {fmt(rec['last_leave'])}")
+        if secs >= CAMERA_MIN_MINS*60 and cp < CAMERA_MIN_PCT: bits.append(f"LOW CAM {cp*100:.0f}%")
+        rows.append({"name": rec["name"], "status": status, "detail": " · ".join(bits),
+                     "hours": secs/3600.0, "cam": cp})
     role = guild.get_role(VERIFIED_ROLE_ID) if guild else None
-    if role:
+    if role:                                             # every verified member — no-shows included
         for m in role.members:
-            if not m.bot and str(m.id) not in today: absent.append(f"• {m.display_name}")
-    violators.sort(reverse=True)
-    end_t = end_today() or dt.time(18, 0)
-    e = discord.Embed(title=f"📋 Attendance — {now_pt().strftime('%A, %b %-d')}",
-        description=f"Start **{start.strftime('%-I:%M %p')} PT** · End **{end_t.strftime('%-I:%M %p')} PT**",
-        color=0xE23B3B if (late or early or absent or lowcam) else 0x2ECC71)
-    e.add_field(name=f"🔴 Late ({len(late)})", value="\n".join(late) or "None 🎉", inline=False)
-    e.add_field(name=f"🟠 Left before {end_t.strftime('%-I:%M %p')} ({len(early)})", value="\n".join(early) or "None 🎉", inline=False)
-    e.add_field(name=f"📷 Low camera — under {int(CAMERA_MIN_PCT*100)}% ({len(lowcam)})",
-                value="\n".join(lowcam) or "None 🎉", inline=False)
-    e.add_field(name=f"✅ Full day, on time ({len(full)})", value="\n".join(full) or "—", inline=False)
-    if absent: e.add_field(name=f"⚫ No-show ({len(absent)})", value="\n".join(absent), inline=False)
-    if violators:
-        e.add_field(name="⚠️ Violation points (late + early)",
-            value="\n".join(f"• {n} — {p} pt{'s' if p!=1 else ''}" for p, n in violators[:10]), inline=False)
+            if not m.bot and str(m.id) not in today:
+                rows.append({"name": m.display_name, "status": "noshow", "detail": "never joined a room",
+                             "hours": 0.0, "cam": 0.0})
+    if not rows: return
+    sev = {"noshow": 0, "late+early": 1, "late": 2, "early": 3, "ontime": 4}
+    rows.sort(key=lambda r: (sev.get(r["status"], 5), -r["hours"]))     # problems on top
+    day_label = now_pt().strftime("%A, %B %-d")
+    buf = render_daily_card(day_label, start.strftime("%-I:%M %p"), end_t.strftime("%-I:%M %p"), rows)
+    problems = sum(1 for r in rows if r["status"] != "ontime")
+    e = discord.Embed(title=f"📋 Attendance — {day_label}",
+        description=(f"**{len(rows) - problems}/{len(rows)}** clean · "
+                     f"**{problems}** flagged — reds & yellows on top"),
+        color=0xE23B3B if problems else 0x2ECC71)
     e.set_footer(text="Private · Pacific · AFK not counted")
-    try: await ch.send(embed=e)
+    try:
+        if buf:
+            f = discord.File(buf, filename="daily.png")
+            e.set_image(url="attachment://daily.png")
+            await ch.send(embed=e, file=f)
+        else:                                            # Pillow missing — text fallback
+            for r in rows[:25]:
+                e.add_field(name=r["name"],
+                            value=f"{DAILY_STATUS_LABEL.get(r['status'],'')} {r.get('detail','')} · {r['hours']:.1f}h",
+                            inline=False)
+            await ch.send(embed=e)
     except Exception as ex: print("daily", ex)
     snapshot_today()
     await post_autoflags(ch, guild)
