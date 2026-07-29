@@ -29,10 +29,12 @@ Excel Financial — Attendance & Culture Bot  (v4)
   QUESTS         — #recognition: one rotating RESULTS quest per week (AP / deals / apps /
                    big-case). Auto-tracked from the deals feed; live shoutout when a rep
                    clears it, recap with the Saturday recognition card.
-  TEAM PRODUCTION— #team-production: manager leaderboard. Every rep's production is rolled
-                   up their full upline chain (from the tracker), so each manager shows
-                   self + entire downline. Submitted-AP board edits itself live all month;
-                   an issued-IP team board posts at month end (1st).
+  TEAM PRODUCTION— #team-production: two top-10 boards in one auto-updating post — a
+                   MANAGER SCOREBOARD (each rep's downline rolled up their full upline
+                   chain from the tracker; only managers whose downline has written
+                   business appear) and an INDIVIDUAL SCOREBOARD (personal production).
+                   Submitted-AP edits itself live all month; an issued-IP version posts at
+                   month end (1st).
 
 Violation POINTS count only late + early. Camera and no-shows are reported for
 awareness but don't add points. Times are Pacific (auto PST/PDT). AFK not counted.
@@ -1078,32 +1080,44 @@ def _managers(state):
     return {up for up in uplines.values() if up and (not roster or up in roster)}
 
 def _team_board_embed(state, prod, month_label, *, kind):
+    metric = "IP" if kind == "ip" else "AP"
     team = _team_rollup(state, prod)
     sizes = _downline_counts(state)
-    rows = []
+    # --- Manager Scoreboard: managers whose DOWNLINE has written business (top 10) ---
+    mrows = []
     for mgr in _managers(state):
-        if str(mgr).lower() in IP_EXCLUDE: continue     # owner's team = everyone; not a ranking
+        if str(mgr).lower() in IP_EXCLUDE: continue    # owner's team = everyone; not a ranking
+        own = float(prod.get(mgr, 0) or 0)
         tv = team.get(mgr, 0.0)
-        if tv <= 0: continue
-        rows.append({"a": mgr, "team": tv, "own": float(prod.get(mgr, 0) or 0), "size": sizes.get(mgr, 0)})
-    if not rows: return None
-    rows.sort(key=lambda r: r["team"], reverse=True)
-    head = f"{'#':<2}{'Manager':<12}{'Team':>8}{'Own':>7}{'Dn':>4}"
-    lines = [head, "─" * len(head)]
-    for i, r in enumerate(rows, 1):
-        nm = r["a"].split()[0][:11]
-        lines.append(f"{i:<2}{nm:<12}{_kfmt(r['team']):>8}{_kfmt(r['own']):>7}{r['size']:>4}")
-    table = "```\n" + "\n".join(lines) + "\n```"
+        if (tv - own) <= 0: continue                   # no producing downline -> off the manager board
+        mrows.append({"a": mgr, "team": tv, "own": own, "size": sizes.get(mgr, 0)})
+    mrows.sort(key=lambda r: r["team"], reverse=True)
+    mrows = mrows[:10]
+    # --- Individual Scoreboard: top 10 by personal production ---
+    irows = [(a, float(v or 0)) for a, v in prod.items()
+             if str(a).lower() not in IP_EXCLUDE and float(v or 0) > 0]
+    irows.sort(key=lambda r: r[1], reverse=True)
+    irows = irows[:10]
+    if not mrows and not irows: return None
+    blocks = []
+    if mrows:
+        head = f"{'#':<2}{'Manager':<12}{'Team':>8}{'Own':>7}{'Dn':>4}"
+        L = [head, "─" * len(head)]
+        for i, r in enumerate(mrows, 1):
+            L.append(f"{i:<2}{r['a'].split()[0][:11]:<12}{_kfmt(r['team']):>8}{_kfmt(r['own']):>7}{r['size']:>4}")
+        blocks.append(f"__**👔 Manager Scoreboard — team {metric}**__\n```\n" + "\n".join(L) + "\n```")
+    if irows:
+        head = f"{'#':<2}{'Rep':<13}{metric:>8}"
+        L = [head, "─" * len(head)]
+        for i, (a, v) in enumerate(irows, 1):
+            L.append(f"{i:<2}{a.split()[0][:12]:<13}{_kfmt(v):>8}")
+        blocks.append(f"__**🙋 Individual Scoreboard — personal {metric}**__\n```\n" + "\n".join(L) + "\n```")
     if kind == "ip":
-        title = f"🏅 Team IP — {month_label} (issued, end-of-month)"
-        sub = "Team **issued premium**, rolled up the full hierarchy"
-        color = 0xE67E22
+        title = f"🏅 Team + Individual IP — {month_label} (issued, month-end)"; color = 0xE67E22
     else:
-        title = f"🏆 Team Production — {month_label}"
-        sub = "Team **submitted AP**, rolled up the full hierarchy · updates live"
-        color = 0xF1C40F
-    e = discord.Embed(title=title, description=f"{sub}\n{table}", color=color)
-    e.set_footer(text="Team = self + entire downline · Own = personal · Dn = downline headcount")
+        title = f"🏆 Team + Individual Production — {month_label}"; color = 0xF1C40F
+    e = discord.Embed(title=title, description="\n".join(blocks), color=color)
+    e.set_footer(text="Manager = self + downline (needs downline production) · Individual = personal · top 10 · auto-updates")
     return e
 
 async def refresh_team_ap_board():
@@ -1121,7 +1135,7 @@ async def refresh_team_ap_board():
     e = _team_board_embed(state, prod, label, kind="ap")
     if not e: return
     async for m in ch.history(limit=25):
-        if m.author == client.user and m.embeds and (m.embeds[0].title or "").startswith("🏆 Team Production"):
+        if m.author == client.user and m.embeds and (m.embeds[0].title or "").startswith("🏆 Team"):
             try: await m.edit(embed=e)
             except Exception as ex: print("team edit", ex)
             return
