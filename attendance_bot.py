@@ -13,6 +13,13 @@ Excel Financial — Attendance & Culture Bot  (v4)
   WEEKLY         — Saturdays 10:00 AM PT:
                    PUBLIC  (#weekly-report): top hours + perfect-week shout-outs;
                    PRIVATE (#attendance-log): top violators + at-risk + low-camera.
+  IP REPORTS     — #ip-reports: Issued Premium scoreboard, posted when you drop a
+                   month-to-date Gateway file into the tracker. WEEKLY drops show each
+                   agent's production SINCE THE LAST DROP (new MTD − previous MTD), top 5,
+                   auto-numbered "August — Week N IP Report". Tick "Final MTD" in the
+                   tracker on the month's last drop to post the top-10 cumulative total.
+                   The tracker computes the delta & week number; the bot just formats and
+                   posts. No fixed schedule. Same SUPABASE_KEY as deals.
 
 Violation POINTS count only late + early. Camera and no-shows are reported for
 awareness but don't add points. Times are Pacific (auto PST/PDT). AFK not counted.
@@ -69,6 +76,22 @@ WEEKLY_APPS_GOAL = 150         # team's weekly apps goal — change to your real
 MILESTONE_DEALS = [25, 50, 75, 100, 150, 200, 300]
 MILESTONE_AP    = [25000, 50000, 100000, 150000, 200000, 300000]
 MILESTONE_FILE  = "milestone_state.json"
+
+# --- IP Reports: Issued Premium scoreboard from the tracker's Gateway MTD imports ---
+# Reads the same Supabase app_state blob your Goal & Commit Tracker syncs to. Each time
+# you drop a month-to-date Gateway file, the TRACKER stages a report payload
+# (state.ipReport) with that week's per-agent delta (new MTD − previous MTD) and an
+# auto-incrementing week number; this bot detects it (within ~5 min) and posts to
+# #ip-reports:
+#   • a normal drop        -> "<Month> — Week N IP Report"   (top 5 by this week's issued)
+#   • a "Final MTD" drop    -> "<Month> — Final MTD IP Report" (top 10 by month total)
+# You mark the final one with the "Final MTD" checkbox in the tracker's import box.
+# No fixed schedule. Uses the same SUPABASE_KEY / SUPABASE_URL as the deals feed.
+IP_REPORTS_CH_ID = 1531721169722675361          # #ip-reports
+IP_STATE_FILE    = "ip_state.json"
+IP_WEEKLY_N      = 5            # top-N on a weekly (weeks 1-4) board
+IP_MONTHLY_N     = 10           # top-N on the Final MTD (last week) board
+IP_EXCLUDE       = {"jesse englert"}   # names kept off the public board (owner's own pen); lowercase
 
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -560,6 +583,137 @@ async def post_deals_weekly():
     except Exception as ex: print("deals weekly send", ex)
 
 
+# ---- IP Reports (Issued Premium scoreboard from the tracker) --------------
+async def fetch_app_state():
+    """Pull the tracker's full state blob from Supabase app_state (id=main)."""
+    url = f"{SUPABASE_URL}/rest/v1/app_state"
+    headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
+    params = {"id": "eq.main", "select": "data"}
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, params=params, headers=headers,
+                         timeout=aiohttp.ClientTimeout(total=25)) as r:
+            if r.status != 200:
+                print("app_state fetch", r.status, (await r.text())[:200]); return None
+            rows = await r.json()
+    if not rows or not isinstance(rows, list): return None
+    data = rows[0].get("data")
+    return data if isinstance(data, dict) else None
+
+def _month_label(mkey):
+    try:
+        y, m = mkey.split("-");
+        return dt.date(int(y), int(m), 1).strftime("%B %Y")
+    except Exception:
+        return mkey
+
+def _filter_agents(state, raw, positive_only=True):
+    """Roster-only map with the owner and off-roster ghosts removed. Used for both the
+       cumulative MTD (a month's net) and the weekly delta the tracker computes."""
+    roster = set(str(n).strip().lower() for n in (state.get("roster") or []))
+    out = {}
+    for agent, v in (raw or {}).items():
+        nm = str(agent).strip()
+        low = nm.lower()
+        if low in IP_EXCLUDE: continue
+        if roster and low not in roster: continue      # keep quitters/ghosts off the public board
+        val = _num(v)
+        if positive_only and val <= 0: continue
+        out[nm] = val
+    return out
+
+def _net_map(state, mkey):
+    """{agent: cumulative issued IP} for one month, roster-only, owner & ghosts removed."""
+    months = state.get("months") or {}
+    return _filter_agents(state, (months.get(mkey) or {}).get("net") or {})
+
+def _months_with_ip(state):
+    """Sorted list of month keys (oldest->newest) that have any qualifying IP."""
+    months = state.get("months") or {}
+    keys = [k for k in months.keys() if _net_map(state, k)]
+    return sorted(keys)
+
+def ip_leaderboard(net_map, n):
+    rows = sorted(net_map.items(), key=lambda kv: kv[1], reverse=True)[:n]
+    medals = ["🥇", "🥈", "🥉"]
+    out = []
+    for i, (name, v) in enumerate(rows):
+        tag = medals[i] if i < 3 else f"**{i+1}.**"
+        out.append(f"{tag} {name} — **${int(round(v)):,}**")
+    return "\n".join(out) or "—"
+
+def ip_signature(state):
+    """Fingerprint that changes each time the tracker records a new IP report (every
+       Gateway drop stamps state.ipReport.at), so each drop posts exactly once."""
+    rpt = state.get("ipReport") or {}
+    return json.dumps({"at": rpt.get("at"), "m": rpt.get("month"), "lbl": rpt.get("label")},
+                      sort_keys=True)
+
+async def post_ip_report():
+    """Post the IP board the tracker just staged in state.ipReport.
+       Weekly drop  -> top-5 by each agent's production SINCE THE LAST DROP (the delta).
+       Final MTD    -> top-10 by the month's cumulative issued total.
+       Week number and the final flag are decided in the tracker (auto-count + checkbox)."""
+    ch = client.get_channel(IP_REPORTS_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state:
+        print("ip report: no state"); return
+    rpt = state.get("ipReport") or {}
+    mkey = rpt.get("month")
+    if not mkey:
+        print("ip report: no ipReport payload (old tracker?)"); return
+    label = _month_label(mkey)                         # "August 2026"
+    mname = label.split(" ")[0]                         # "August"
+    fname = rpt.get("file")
+    if rpt.get("final"):
+        nm = _net_map(state, mkey)                     # cumulative MTD
+        if not nm: return
+        n = IP_MONTHLY_N; total = sum(nm.values())
+        board = ip_leaderboard(nm, n)
+        title = f"🏆 {mname} — Final MTD IP Report"
+        desc  = f"Month-to-date: **${int(round(total)):,}** issued · top {min(n, len(nm))}"
+        field = "Issued Premium — month total"
+        color = 0xE67E22
+    else:
+        wk = rpt.get("week")
+        weekly = _filter_agents(state, rpt.get("weekly") or {})   # production since last drop
+        n = IP_WEEKLY_N; total = sum(weekly.values())
+        board = ip_leaderboard(weekly, n)
+        wtxt = f"Week {wk}" if wk else "Weekly"
+        title = f"📈 {mname} — {wtxt} IP Report"
+        if weekly:
+            desc = f"Issued since last drop: **${int(round(total)):,}** · top {min(n, len(weekly))}"
+        else:
+            desc = "No new issued production since the last drop."
+        field = "Issued Premium — this week"
+        color = 0x5865F2
+    e = discord.Embed(title=title, description=desc, color=color)
+    e.add_field(name=field, value=board, inline=False)
+    foot = "Excel Financial · from your Gateway MTD import"
+    if fname: foot += f" ({fname})"
+    e.set_footer(text=foot)
+    try: await ch.send(embed=e)
+    except Exception as ex: print("ip report send", ex)
+
+@tasks.loop(minutes=5)
+async def ip_poller():
+    """Watch the tracker for a new Gateway import (net data changed) and post the board."""
+    if not SUPABASE_KEY: return
+    if not client.get_channel(IP_REPORTS_CH_ID): return
+    try:
+        state = await fetch_app_state()
+    except Exception as e:
+        print("ip poll error", e); return
+    if not state: return
+    sig = ip_signature(state)
+    st = load_json(IP_STATE_FILE, {"sig": None, "init": False})
+    if not st.get("init"):
+        st["init"] = True; st["sig"] = sig; save_json(IP_STATE_FILE, st); return  # no history spam on first boot
+    if sig != st.get("sig"):
+        st["sig"] = sig; save_json(IP_STATE_FILE, st)
+        await post_ip_report()
+
+
 # ---- scheduler ------------------------------------------------------------
 _last_daily = None
 _last_weekly = None
@@ -570,6 +724,7 @@ async def on_ready():
     load_state(); await ensure_start_message()
     if not scheduler.is_running(): scheduler.start()
     if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
+    if SUPABASE_KEY and not ip_poller.is_running(): ip_poller.start()
 
 @tasks.loop(seconds=30)
 async def scheduler():
@@ -579,6 +734,7 @@ async def scheduler():
         _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
         _last_weekly = n.date(); await post_weekly()   # recognition now includes weekly deals
+    # IP Reports are import-driven (see ip_poller) — no fixed weekly/monthly schedule.
 
 
 if __name__ == "__main__":
