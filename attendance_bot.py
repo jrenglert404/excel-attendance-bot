@@ -42,13 +42,21 @@ Python 3.9+, discord.py 2.3+.  Set DISCORD_TOKEN in the environment.
 """
 
 import os
+import io
 import json
+import asyncio
 import datetime as dt
 from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
 from discord.ext import tasks
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAVE_PIL = True
+except Exception:
+    HAVE_PIL = False      # cards silently fall back to text if Pillow isn't installed
 
 # ---------------------------------------------------------------------------
 GUILD_ID              = 1530612426133868574
@@ -66,8 +74,9 @@ SCHEDULE = {0: dt.time(8, 30), 1: dt.time(9, 0), 2: dt.time(9, 0),
 # Per-day end of the call session (early-leave cutoff & daily report time).
 END_BY_DAY  = {0: dt.time(18, 0), 1: dt.time(18, 0), 2: dt.time(18, 0),
                3: dt.time(18, 0), 4: dt.time(18, 0), 5: dt.time(14, 0)}  # Sat ends 2 PM
-WEEKLY_TIME = dt.time(10, 0)
-WEEKLY_DAY  = 5                 # Saturday
+WEEKLY_TIME = dt.time(18, 0)
+WEEKLY_DAY  = 6                 # Sunday — the 6 PM PT "Sunday Wrap"
+MONTHLY_TIME = dt.time(10, 0)   # 1st-of-month reports post at 10 AM PT
 
 FLAG_LATE   = 3
 FLAG_EARLY  = 2
@@ -120,6 +129,94 @@ LEAD_TABLE        = "lead_purchases"       # Supabase append-only log (see setup
 #     issued-IP team board posts at month end. ---
 TEAM_CH_ID = 1531861880824402000           # #team-production
 
+# --- Rank roles: auto-awarded at the Sunday Wrap (and Top IP on the Final MTD drop) ---
+ROLE_CLOSER  = 1531874671220494416   # 💰 Closer of the Week
+ROLE_GRINDER = 1531874672176664638   # ⏱️ Grinder of the Week
+ROLE_MANAGER = 1531874673237954753   # 👔 Top Manager
+ROLE_TOP_IP  = 1531874674215227503   # 📈 Top IP
+
+# --- Slash commands live in #commands (instructions auto-posted there) ---
+COMMANDS_CH_ID = 1531874676257591537
+
+# --- Durable state: every state file is mirrored to the Supabase bot_state table so
+#     history (attendance, streaks, quest winners) SURVIVES redeploys. ---
+BOT_STATE_TABLE = "bot_state"
+
+# --- Branded leaderboard cards (black & gold, lion logo). Keep logo.png next to the bot.
+LOGO_FILE = "logo.png"
+CARD_GOLD  = (212, 175, 55)
+CARD_BLACK = (13, 13, 16)
+CARD_WHITE = (238, 238, 238)
+CARD_DIM   = (150, 150, 150)
+CARD_LINE  = (44, 44, 50)
+MEDAL_COLS = [(255, 215, 0), (200, 200, 205), (205, 127, 80)]  # gold / silver / bronze
+
+def _card_font(size, bold=False):
+    cands = (["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"] if bold else
+             ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              "/usr/share/fonts/dejavu/DejaVuSans.ttf"])
+    for p in cands:
+        try: return ImageFont.truetype(p, size)
+        except Exception: pass
+    try: return ImageFont.load_default(size)
+    except Exception: return ImageFont.load_default()
+
+def render_card(title, subtitle, rows, footer="EXCEL FINANCIAL"):
+    """rows = [(name, value_str)]. Returns BytesIO PNG, or None if Pillow unavailable."""
+    if not HAVE_PIL or not rows: return None
+    W = 1000; row_h = 64; top = 208
+    H = top + len(rows) * row_h + 84
+    img = Image.new("RGB", (W, H), CARD_BLACK)
+    d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
+    tx = 60
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo = Image.open(LOGO_FILE).convert("RGBA").resize((130, 130), Image.LANCZOS)
+            img.paste(logo, (48, 40), logo)
+            tx = 210
+        except Exception: pass
+    d.text((tx, 52), title.upper(), font=_card_font(46, True), fill=CARD_GOLD)
+    d.text((tx, 118), subtitle, font=_card_font(27), fill=CARD_WHITE)
+    y = top
+    for i, (name, val) in enumerate(rows):
+        col = MEDAL_COLS[i] if i < 3 else CARD_WHITE
+        d.text((64, y), f"{i + 1}", font=_card_font(32, True), fill=col)
+        d.text((130, y), str(name)[:26], font=_card_font(32, i < 3), fill=col)
+        vf = _card_font(32, True)
+        vw = d.textlength(str(val), font=vf)
+        d.text((W - 64 - vw, y), str(val), font=vf, fill=CARD_GOLD)
+        if i < len(rows) - 1:
+            d.line([54, y + row_h - 14, W - 54, y + row_h - 14], fill=CARD_LINE, width=1)
+        y += row_h
+    d.text((64, H - 58), footer, font=_card_font(20), fill=CARD_DIM)
+    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
+    return buf
+
+async def send_card(ch, embed, title, subtitle, rows, footer="EXCEL FINANCIAL"):
+    """Send embed with a branded card image if possible, else the embed alone."""
+    buf = render_card(title, subtitle, rows, footer)
+    try:
+        if buf:
+            f = discord.File(buf, filename="card.png")
+            embed.set_image(url="attachment://card.png")
+            await ch.send(embed=embed, file=f)
+        else:
+            await ch.send(embed=embed)
+    except Exception as ex:
+        print("card send", ex)
+
+async def ensure_bot_avatar():
+    """One-time: if the bot has no avatar yet, set it to the lion logo automatically."""
+    try:
+        if client.user and client.user.avatar is None and os.path.exists(LOGO_FILE):
+            with open(LOGO_FILE, "rb") as f:
+                await client.user.edit(avatar=f.read())
+            print("bot avatar set to logo")
+    except Exception as e:
+        print("avatar", e)
+
 # --- Weekly Quests: rotating RESULTS challenges, auto-tracked from the deals feed ---
 QUEST_CH_ID     = RECOGNITION_CH_ID     # quests + shoutouts land in #recognition
 QUEST_STATE_FILE = "quest_state.json"
@@ -144,6 +241,7 @@ intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
 
 today = {}
 current_day = None
@@ -168,10 +266,52 @@ def load_json(p, d):
         except Exception as e: print("load", p, e)
     return d
 
+async def _cloud_push_state(key, d):
+    """Mirror one state blob to Supabase so it survives redeploys."""
+    if not SUPABASE_KEY: return
+    url = f"{SUPABASE_URL}/rest/v1/{BOT_STATE_TABLE}?on_conflict=id"
+    headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}",
+               "content-type": "application/json",
+               "Prefer": "resolution=merge-duplicates,return=minimal"}
+    body = {"id": key, "data": d, "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json=body, headers=headers,
+                              timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status not in (200, 201, 204):
+                    print("state push", key, r.status)
+    except Exception as e:
+        print("state push", key, e)
+
+async def cloud_pull_state():
+    """On boot: restore every state file from Supabase (newer cloud copy wins on a fresh box)."""
+    if not SUPABASE_KEY: return
+    url = f"{SUPABASE_URL}/rest/v1/{BOT_STATE_TABLE}"
+    headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params={"select": "id,data"}, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status != 200:
+                    print("state pull", r.status); return
+                rows = await r.json()
+        for row in rows or []:
+            key = row.get("id"); data = row.get("data")
+            if key and data is not None and not os.path.exists(key):
+                with open(key, "w") as f: json.dump(data, f)
+        print(f"state restored: {len(rows or [])} blobs")
+    except Exception as e:
+        print("state pull", e)
+
 def save_json(p, d):
     try:
         with open(p, "w") as f: json.dump(d, f)
     except Exception as e: print("save", p, e)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_cloud_push_state(p, d))   # fire-and-forget cloud mirror
+    except RuntimeError:
+        pass                                        # no loop yet (startup) — cloud copy comes next save
 
 def save_state(): save_json(STATE_FILE, {"day": current_day, "today": today})
 
@@ -378,7 +518,9 @@ def bar(pct, width=14):
     f = int(round(pct * width))
     return "█" * f + "░" * (width - f)
 
-async def post_weekly():
+async def post_sunday_wrap():
+    """ONE consolidated public post (Sunday 6 PM PT): recognition + quest recap + card.
+       Also awards the weekly rank roles. Private accountability posts separately below."""
     agg = aggregate_week()
     rows = list(agg.values())
     deals = []
@@ -388,10 +530,9 @@ async def post_weekly():
         except Exception as e: print("recog deals", e)
     ds = summarize_deals(deals)
 
-    # ---- PUBLIC recognition -> #recognition ----
     rec = client.get_channel(RECOGNITION_CH_ID)
     if rec:
-        e = discord.Embed(title="🏅 Weekly Recognition",
+        e = discord.Embed(title="🏁 Sunday Wrap",
             description=now_pt().strftime("Week ending %A, %b %-d"), color=0xF1C40F)
         pct = (ds["apps"] / WEEKLY_APPS_GOAL) if WEEKLY_APPS_GOAL else 0
         e.add_field(name="🎯 Team Goal",
@@ -402,14 +543,48 @@ async def post_weekly():
         e.add_field(name="⏱️ Top Hours",
             value="\n".join(f"**{i+1}.** {r['name']} — {r['hours']:.1f}h" for i, r in enumerate(top)) or "—",
             inline=False)
+        # quest recap folded in
+        qs = load_json(QUEST_STATE_FILE, {})
+        q = QUEST_BY_ID.get(qs.get("quest_id"))
+        if q:
+            winners = qs.get("winners", [])
+            qtxt = (", ".join(f"**{w}**" for w in winners) + " 👏") if winners \
+                   else "Nobody cleared it — new quest drops Monday."
+            e.add_field(name=f"{q['emoji']} Quest — {q['title']}", value=qtxt, inline=False)
         deal_names = set(str(n).strip().lower() for n in ds["by"])
         warm = [r["name"] for r in rows if r["hours"] >= 5 and r["name"].strip().lower() not in deal_names]
         if warm:
             e.add_field(name="🪑 On the clock, no deals yet",
                 value="\n".join("• " + n for n in warm[:10]), inline=False)
-        e.set_footer(text="Excel Financial · hours exclude AFK")
-        try: await rec.send(embed=e)
-        except Exception as ex: print("recognition", ex)
+        e.set_footer(text="Excel Financial · hours exclude AFK · roles refreshed weekly")
+        card_rows = sorted(ds["by"].items(), key=lambda kv: kv[1]["ap"], reverse=True)[:5]
+        card_rows = [(nm2, f"${int(s['ap']):,} · {s['deals']}d") for nm2, s in card_rows]
+        if card_rows:
+            await send_card(rec, e, "Top Closers", now_pt().strftime("Week ending %A, %b %-d"),
+                            card_rows, "EXCEL FINANCIAL · SUNDAY WRAP")
+        else:
+            try: await rec.send(embed=e)
+            except Exception as ex: print("recognition", ex)
+
+    # ---- weekly rank roles ----
+    try:
+        top_closer = max(ds["by"].items(), key=lambda kv: kv[1]["ap"])[0] if ds["by"] else None
+        top_hours = max(rows, key=lambda r: r["hours"])["name"] if rows else None
+        top_mgr = None
+        if SUPABASE_KEY:
+            state = await fetch_app_state()
+            if state:
+                prod = _submitted_ap_by_agent(state, _live_month_key())
+                team = _team_rollup(state, prod)
+                mgrs = [(mgr, team.get(mgr, 0)) for mgr in _managers(state)
+                        if str(mgr).lower() not in IP_EXCLUDE
+                        and (team.get(mgr, 0) - float(prod.get(mgr, 0) or 0)) > 0]
+                if mgrs: top_mgr = max(mgrs, key=lambda kv: kv[1])[0]
+        await award_role(ROLE_CLOSER, top_closer)
+        await award_role(ROLE_GRINDER, top_hours)
+        await award_role(ROLE_MANAGER, top_mgr)
+    except Exception as ex:
+        print("rank roles", ex)
 
     priv = client.get_channel(LOG_CHANNEL_ID)
     if priv:
@@ -739,12 +914,27 @@ async def post_ip_report():
         field = "Issued Premium — this week"
         color = 0x5865F2
     e = discord.Embed(title=title, description=desc, color=color)
-    e.add_field(name=field, value=board, inline=False)
     foot = "Excel Financial · from your Gateway MTD import"
     if fname: foot += f" ({fname})"
     e.set_footer(text=foot)
-    try: await ch.send(embed=e)
-    except Exception as ex: print("ip report send", ex)
+    if rpt.get("final"):
+        card_rows = sorted(nm.items(), key=lambda kv: kv[1], reverse=True)[:n]
+        card_title = f"{mname} Final MTD IP"
+        card_sub = f"Month-to-date · ${int(round(total)):,} issued"
+    else:
+        card_rows = sorted(weekly.items(), key=lambda kv: kv[1], reverse=True)[:n]
+        card_title = f"{mname} {wtxt} IP Report"
+        card_sub = f"Issued since last drop · ${int(round(total)):,}"
+    card_rows = [(a, f"${int(round(v)):,}") for a, v in card_rows]
+    if card_rows:
+        await send_card(ch, e, card_title, card_sub, card_rows, "EXCEL FINANCIAL · ISSUED PREMIUM")
+    else:
+        e.add_field(name=field, value=board, inline=False)
+        try: await ch.send(embed=e)
+        except Exception as ex: print("ip report send", ex)
+    if rpt.get("final") and nm:                     # 📈 Top IP rank role follows the Final MTD
+        try: await award_role(ROLE_TOP_IP, max(nm.items(), key=lambda kv: kv[1])[0])
+        except Exception as ex: print("top ip role", ex)
 
 @tasks.loop(minutes=5)
 async def ip_poller():
@@ -967,6 +1157,24 @@ async def post_lead_report():
         color=0xE67E22)
     e.add_field(name="By lead type", value="\n".join(type_lines) or "—", inline=False)
     e.add_field(name="By vendor", value="\n".join(vend_lines) or "—", inline=False)
+    # conversion intel: what a deal/app actually costs, team-wide and per rep
+    try:
+        mstart = now_pt().replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc).isoformat()
+        ds = summarize_deals(await fetch_deals_since(mstart))
+        if ds["count"]:
+            cpd = total_spend / ds["count"]; cpa = total_spend / max(ds["apps"], 1)
+            lpa = total_leads / max(ds["apps"], 1)
+            agent_tot = _agent_lead_totals(purchases)
+            rep_lines = []
+            for a, t in sorted(agent_tot.items(), key=lambda kv: kv[1]["spend"], reverse=True)[:8]:
+                aap = ds["by"].get(a, {}).get("apps", 0)
+                rep_lines.append(f"• {a} — ${int(t['spend']):,} spend · "
+                                 + (f"${t['spend']/aap:,.0f}/app" if aap else "no apps yet"))
+            e.add_field(name="📐 Conversion",
+                value=(f"Team: **${cpd:,.0f}/deal** · **${cpa:,.0f}/app** · {lpa:.0f} leads per app\n"
+                       + "\n".join(rep_lines)), inline=False)
+    except Exception as ex:
+        print("conversion intel", ex)
     e.set_footer(text="Owner-only · what the team is buying · month-to-date")
     try: await ch.send(embed=e)
     except Exception as ex: print("lead report send", ex)
@@ -1115,7 +1323,11 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None):
         blocks.append(f"🏛️ **Excel Financial — {month_label}: ${int(round(floor_total)):,} issued IP**")
     else:
         dtxt = f" · **{deal_count} deals**" if deal_count else ""
-        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${int(round(floor_total)):,} AP**{dtxt}")
+        n = now_pt()
+        days_in = (dt.date(n.year + (n.month == 12), (n.month % 12) + 1, 1) - dt.date(n.year, n.month, 1)).days
+        proj = floor_total / max(n.day, 1) * days_in
+        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${int(round(floor_total)):,} AP**{dtxt}\n"
+                      f"📈 Pace: day {n.day}/{days_in} · projecting **${int(round(proj)):,}** by month end")
     if mrows:
         head = f"{'#':<3}{'Manager':<20}{'Team '+metric:>9}"
         L = [head, "─" * len(head)]
@@ -1180,15 +1392,242 @@ async def post_team_ip_monthly():
     except Exception as ex: print("team ip send", ex)
 
 
+# ---- rank roles ------------------------------------------------------------
+def find_member(name):
+    """Best-effort roster-name -> guild member (display name / global name match)."""
+    guild = client.get_guild(GUILD_ID)
+    if not (guild and name): return None
+    q = str(name).strip().lower()
+    for m in guild.members:
+        for cand in (m.display_name, getattr(m, "global_name", None), m.name):
+            if cand and cand.strip().lower() == q: return m
+    first = q.split()[0]
+    hits = [m for m in guild.members if m.display_name.strip().lower().startswith(first)]
+    return hits[0] if len(hits) == 1 else None
+
+async def award_role(role_id, winner_name):
+    """Move a weekly rank role to its new holder (clears previous holders)."""
+    guild = client.get_guild(GUILD_ID)
+    role = guild.get_role(role_id) if guild else None
+    if not role: return
+    winner = find_member(winner_name) if winner_name else None
+    for m in list(role.members):
+        if m != winner:
+            try: await m.remove_roles(role, reason="weekly rank rotation")
+            except Exception as e: print("role rm", e)
+    if winner and role not in winner.roles:
+        try: await winner.add_roles(role, reason="weekly rank award")
+        except Exception as e: print("role add", e)
+
+
+# ---- slash commands (#commands) --------------------------------------------
+async def ensure_commands_message():
+    ch = client.get_channel(COMMANDS_CH_ID)
+    if not ch: return
+    e = discord.Embed(title="🤖 Excel Bot — Commands",
+        description=(
+            "Type `/` in any channel and pick a command. **Answers are private — only you see them.**\n\n"
+            "**/mystats** — your week: hours, camera %, lates · your month: deals, AP, lead spend & ROI\n"
+            "**/leaderboard** — this month's top 10 by personal AP + the team total\n"
+            "**/team** — this month's top managers by team AP (full downlines)\n"
+            "**/pace** — where the month is tracking vs. where it'll land\n\n"
+            "**Logging lead orders** → hit the button in <#" + str(LEAD_ROI_CH_ID) + "> every time you buy.\n"
+            "*Tip: keep your server nickname set to your real name so the bot can match your production.*"),
+        color=0x5865F2)
+    e.set_footer(text="Excel Financial · commands are free to spam — nobody else sees them")
+    async for m in ch.history(limit=10):
+        if m.author == client.user and m.embeds:
+            try: await m.edit(embed=e)
+            except Exception: pass
+            return
+    try:
+        msg = await ch.send(embed=e)
+        try: await msg.pin()
+        except Exception: pass
+    except Exception as ex: print("commands msg", ex)
+
+def _fmt_x(ap, spend): return f"{ap/spend:.1f}x" if spend else "—"
+
+@tree.command(name="mystats", description="Your private stats — week attendance + month production", guild=discord.Object(GUILD_ID))
+async def cmd_mystats(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    name = interaction.user.display_name
+    lines = []
+    row = aggregate_week().get(name)
+    if row:
+        campct = (row["cam"] / row["hours"] * 100) if row["hours"] else 0
+        lines.append(f"**This week:** {row['hours']:.1f}h on the floor · camera {campct:.0f}% · "
+                     f"{row['late']} late · {row['early']} early leave")
+    else:
+        lines.append("**This week:** no floor time logged yet")
+    if SUPABASE_KEY:
+        state = await fetch_app_state()
+        canon = match_roster(state, name) if state else None
+        if canon:
+            mkey = _live_month_key()
+            prod = _submitted_ap_by_agent(state, mkey)
+            chips = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
+            my_ap = prod.get(canon, 0); my_deals = len(chips.get(canon) or [])
+            lines.append(f"**{_month_label(mkey)}:** {my_deals} deals · **${int(round(my_ap)):,} AP**")
+            ipv = _net_map(state, mkey).get(canon)
+            if ipv: lines.append(f"**Issued IP:** ${int(round(ipv)):,}")
+            t = _agent_lead_totals(await fetch_lead_purchases(mkey)).get(canon)
+            if t:
+                lines.append(f"**Lead spend:** ${int(round(t['spend'])):,} · {t['leads']} leads · "
+                             f"AP return {_fmt_x(my_ap, t['spend'])}")
+        else:
+            lines.append("_Couldn't match your nickname to the roster — set your server nickname to your real name._")
+    e = discord.Embed(title=f"📊 {name}", description="\n".join(lines), color=0x1ABC9C)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+@tree.command(name="leaderboard", description="This month's top 10 by personal AP (private view)", guild=discord.Object(GUILD_ID))
+async def cmd_leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not SUPABASE_KEY: return await interaction.followup.send("Data source offline.", ephemeral=True)
+    state = await fetch_app_state()
+    if not state: return await interaction.followup.send("Couldn't reach the tracker.", ephemeral=True)
+    mkey = _live_month_key(); prod = _submitted_ap_by_agent(state, mkey)
+    rows = sorted(((a, v) for a, v in prod.items() if v > 0), key=lambda r: r[1], reverse=True)[:10]
+    medals = ["🥇", "🥈", "🥉"]
+    body = "\n".join(f"{medals[i] if i < 3 else f'**{i+1}.**'} {a} — **${int(round(v)):,}**"
+                     for i, (a, v) in enumerate(rows)) or "No production yet."
+    total = sum(prod.values())
+    e = discord.Embed(title=f"🏆 Individual AP — {_month_label(mkey)}",
+        description=body + f"\n\n🏛️ Team total: **${int(round(total)):,}**", color=0xF1C40F)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+@tree.command(name="team", description="This month's top managers by team AP (private view)", guild=discord.Object(GUILD_ID))
+async def cmd_team(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not SUPABASE_KEY: return await interaction.followup.send("Data source offline.", ephemeral=True)
+    state = await fetch_app_state()
+    if not state: return await interaction.followup.send("Couldn't reach the tracker.", ephemeral=True)
+    mkey = _live_month_key(); prod = _submitted_ap_by_agent(state, mkey)
+    team = _team_rollup(state, prod)
+    rows = [(mgr, team.get(mgr, 0)) for mgr in _managers(state)
+            if str(mgr).lower() not in IP_EXCLUDE
+            and (team.get(mgr, 0) - float(prod.get(mgr, 0) or 0)) > 0]
+    rows.sort(key=lambda r: r[1], reverse=True)
+    medals = ["🥇", "🥈", "🥉"]
+    body = "\n".join(f"{medals[i] if i < 3 else f'**{i+1}.**'} {a} — **${int(round(v)):,}**"
+                     for i, (a, v) in enumerate(rows[:10])) or "No team production yet."
+    e = discord.Embed(title=f"👔 Manager Scoreboard — {_month_label(mkey)}", description=body, color=0x9B59B6)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+@tree.command(name="pace", description="Where the month is tracking (private view)", guild=discord.Object(GUILD_ID))
+async def cmd_pace(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not SUPABASE_KEY: return await interaction.followup.send("Data source offline.", ephemeral=True)
+    state = await fetch_app_state()
+    if not state: return await interaction.followup.send("Couldn't reach the tracker.", ephemeral=True)
+    n = now_pt(); mkey = _live_month_key()
+    prod = _submitted_ap_by_agent(state, mkey); total = sum(prod.values())
+    days_in = (dt.date(n.year + (n.month == 12), (n.month % 12) + 1, 1) - dt.date(n.year, n.month, 1)).days
+    proj = total / max(n.day, 1) * days_in
+    wk_start = (n - dt.timedelta(days=n.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    try: wdeals = summarize_deals(await fetch_deals_since(wk_start.astimezone(dt.timezone.utc).isoformat()))
+    except Exception: wdeals = {"apps": 0}
+    pct = (wdeals["apps"] / WEEKLY_APPS_GOAL) if WEEKLY_APPS_GOAL else 0
+    e = discord.Embed(title=f"📈 Pace — {_month_label(mkey)}",
+        description=(f"**${int(round(total)):,} AP** through day {n.day} of {days_in}\n"
+                     f"Projected month end: **${int(round(proj)):,}**\n\n"
+                     f"This week: **{wdeals['apps']} / {WEEKLY_APPS_GOAL} apps**\n`{bar(pct)}` {pct*100:.0f}%"),
+        color=0x3498DB)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+# ---- monthly analytics (1st of month) --------------------------------------
+def render_trend_chart(labels, ap_vals, ip_vals):
+    """Simple branded AP-vs-IP bar chart. Returns BytesIO PNG or None."""
+    if not HAVE_PIL or not labels: return None
+    W, H = 1000, 520; PAD = 70
+    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
+    d.text((40, 28), "TEAM PRODUCTION TREND", font=_card_font(34, True), fill=CARD_GOLD)
+    d.text((40, 74), "Submitted AP (gold) vs Issued IP (white) by month", font=_card_font(20), fill=CARD_DIM)
+    peak = max(ap_vals + ip_vals + [1])
+    plot_top, plot_bot = 130, H - 80
+    n = len(labels); slot = (W - 2 * PAD) / max(n, 1)
+    for i in range(n):
+        cx = PAD + slot * i + slot / 2
+        for off, val, col in ((-22, ap_vals[i], CARD_GOLD), (4, ip_vals[i], CARD_WHITE)):
+            bh = int((plot_bot - plot_top) * (val / peak))
+            d.rectangle([cx + off, plot_bot - bh, cx + off + 18, plot_bot], fill=col)
+        f = _card_font(18); lw = d.textlength(labels[i], font=f)
+        d.text((cx - lw / 2, plot_bot + 12), labels[i], font=f, fill=CARD_WHITE)
+    d.text((40, H - 42), f"peak ${peak/1000:.0f}k · EXCEL FINANCIAL", font=_card_font(16), fill=CARD_DIM)
+    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
+    return buf
+
+async def post_trend_chart():
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(TEAM_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state: return
+    months = sorted((state.get("months") or {}).keys())[-6:]
+    labels, apv, ipv = [], [], []
+    for mk in months:
+        prod = _submitted_ap_by_agent(state, mk)
+        labels.append(_month_label(mk).split()[0][:3].upper())
+        apv.append(sum(prod.values()))
+        ipv.append(sum(_net_map(state, mk).values()))
+    if not any(apv) and not any(ipv): return
+    buf = render_trend_chart(labels, apv, ipv)
+    if not buf: return
+    try: await ch.send(file=discord.File(buf, filename="trend.png"))
+    except Exception as ex: print("trend", ex)
+
+async def post_ntg_report():
+    """Owner-only: whose business actually issues. NTG = issued IP / submitted AP,
+       for the most recent complete month that has Gateway data."""
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(LEAD_REPORT_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state: return
+    live = _live_month_key()
+    complete = [k for k in _months_with_ip(state) if k < live]
+    if not complete: return
+    mkey = complete[-1]
+    prod = _submitted_ap_by_agent(state, mkey)
+    ipm = _net_map(state, mkey)
+    rows = []
+    for a, ap in prod.items():
+        if str(a).lower() in IP_EXCLUDE or ap <= 0: continue
+        ipv = ipm.get(a, 0.0)
+        rows.append((a, ap, ipv, ipv / ap))
+    if not rows: return
+    rows.sort(key=lambda r: r[3])
+    lines = [f"• **{a}** — ${int(ap):,} AP → ${int(ipv):,} IP · **{ntg*100:.0f}% NTG**"
+             + (" ⚠️" if ntg < 0.5 else "")
+             for a, ap, ipv, ntg in rows[:15]]
+    team_ap = sum(r[1] for r in rows); team_ip = sum(r[2] for r in rows)
+    e = discord.Embed(title=f"🔬 NTG Quality Report — {_month_label(mkey)}",
+        description=(f"Team: ${int(team_ap):,} submitted → ${int(team_ip):,} issued "
+                     f"(**{(team_ip/team_ap*100) if team_ap else 0:.0f}% NTG**)\n"
+                     "Lowest stick-rates first — ⚠️ = under 50%:\n\n" + "\n".join(lines)),
+        color=0xE23B3B)
+    e.set_footer(text="Owner eyes only · submitted AP vs Gateway-issued IP")
+    try: await ch.send(embed=e)
+    except Exception as ex: print("ntg", ex)
+
+
 # ---- scheduler ------------------------------------------------------------
 _last_daily = None
 _last_weekly = None
 _last_team_ip = None
+_last_monthly = None
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}.")
+    await cloud_pull_state()                       # restore history BEFORE anything reads it
     load_state(); await ensure_start_message()
+    await ensure_bot_avatar()
+    try: await tree.sync(guild=discord.Object(GUILD_ID))
+    except Exception as e: print("tree sync", e)
+    await ensure_commands_message()
     if SUPABASE_KEY:
         try: await ensure_lead_roi_message()
         except Exception as e: print("lead roi msg", e)
@@ -1200,11 +1639,12 @@ async def on_ready():
 
 @tasks.loop(seconds=30)
 async def scheduler():
-    global _last_daily, _last_weekly, _last_team_ip
+    global _last_daily, _last_weekly, _last_monthly
     n = now_pt(); ensure_today()
-    # End-of-month manager IP board — once, on the 1st
-    if SUPABASE_KEY and n.day == 1 and n.time() >= WEEKLY_TIME and _last_team_ip != (n.year, n.month):
-        _last_team_ip = (n.year, n.month); await post_team_ip_monthly()
+    # 1st of the month, 10 AM PT — team IP board + trend chart + NTG quality report
+    if SUPABASE_KEY and n.day == 1 and n.time() >= MONTHLY_TIME and _last_monthly != (n.year, n.month):
+        _last_monthly = (n.year, n.month)
+        await post_team_ip_monthly(); await post_trend_chart(); await post_ntg_report()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
     # New week -> open a fresh results quest (once we're into Monday morning)
@@ -1214,13 +1654,13 @@ async def scheduler():
             q = pick_quest()
             save_json(QUEST_STATE_FILE, {"week": _iso_week_key(), "quest_id": q["id"], "winners": []})
             await announce_quest(q)
+    # Sunday 6 PM PT — the wrap (recognition + quest recap + rank roles) and weekly boards
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
         _last_weekly = n.date()
-        await post_weekly()          # recognition + weekly deals
-        await post_quest_recap()     # who cleared this week's quest
-        await post_lead_roi()        # weekly lead-spend ROI scoreboard (public)
-        await post_lead_report()     # lead-buying breakdown by type/vendor (owner-only)
-        await refresh_team_ap_board()  # keep the live manager board fresh weekly too
+        await post_sunday_wrap()       # ONE public wrap + private accountability + roles
+        await post_lead_roi()          # weekly lead-spend ROI scoreboard (public)
+        await post_lead_report()       # lead-buying breakdown (owner-only)
+        await refresh_team_ap_board()  # keep the live manager board fresh
     # IP Reports are import-driven (see ip_poller) — no fixed weekly/monthly schedule.
 
 
