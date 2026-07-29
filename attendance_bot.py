@@ -20,6 +20,13 @@ Excel Financial — Attendance & Culture Bot  (v4)
                    tracker on the month's last drop to post the top-10 cumulative total.
                    The tracker computes the delta & week number; the bot just formats and
                    posts. No fixed schedule. Same SUPABASE_KEY as deals.
+  LEAD ROI       — #lead-roi: reps privately submit their monthly lead spend via a button
+                   + pop-up form; a weekly scoreboard shows spend / AP / IP / AP× / IP×
+                   per rep, ranked by AP written (results-first). Totals only — individual
+                   orders never public. Needs a small Supabase table (setup SQL in README).
+  QUESTS         — #recognition: one rotating RESULTS quest per week (AP / deals / apps /
+                   big-case). Auto-tracked from the deals feed; live shoutout when a rep
+                   clears it, recap with the Saturday recognition card.
 
 Violation POINTS count only late + early. Camera and no-shows are reported for
 awareness but don't add points. Times are Pacific (auto PST/PDT). AFK not counted.
@@ -92,6 +99,29 @@ IP_STATE_FILE    = "ip_state.json"
 IP_WEEKLY_N      = 5            # top-N on a weekly (weeks 1-4) board
 IP_MONTHLY_N     = 10           # top-N on the Final MTD (last week) board
 IP_EXCLUDE       = {"jesse englert"}   # names kept off the public board (owner's own pen); lowercase
+
+# --- Lead ROI board: private lead-spend submissions -> public results scoreboard ---
+LEAD_ROI_CH_ID = 1531853384309669960   # #lead-roi
+LEAD_TABLE     = "lead_spend"           # Supabase table (see README for the one-line setup SQL)
+
+# --- Weekly Quests: rotating RESULTS challenges, auto-tracked from the deals feed ---
+QUEST_CH_ID     = RECOGNITION_CH_ID     # quests + shoutouts land in #recognition
+QUEST_STATE_FILE = "quest_state.json"
+# Every quest is results-only. One runs per ISO week, rotating in order. Anyone who
+# clears the bar gets a live shoutout; a recap posts with the weekly recognition card.
+QUESTS = [
+    {"id": "ap10k",  "emoji": "💵", "title": "$10K AP Week",   "metric": "ap",      "goal": 10000,
+     "desc": "Write **$10,000+ submitted AP** this week."},
+    {"id": "deals5", "emoji": "🔥", "title": "5-Deal Week",    "metric": "deals",   "goal": 5,
+     "desc": "Close **5+ deals** this week."},
+    {"id": "big3k",  "emoji": "🐘", "title": "Big Case Bounty", "metric": "maxdeal", "goal": 3000,
+     "desc": "Close a **single policy worth $3,000+ AP** this week."},
+    {"id": "apps15", "emoji": "⚡", "title": "15-App Week",     "metric": "apps",    "goal": 15,
+     "desc": "Submit **15+ apps** this week."},
+    {"id": "ap20k",  "emoji": "🚀", "title": "$20K AP Club",    "metric": "ap",      "goal": 20000,
+     "desc": "Write **$20,000+ submitted AP** this week."},
+]
+QUEST_BY_ID = {q["id"]: q for q in QUESTS}
 
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -423,6 +453,9 @@ async def on_interaction(interaction):
                 timestamp=dt.datetime.now(dt.timezone.utc))
             await reqch.send(embed=e, view=approve_deny_view(u.id))
         await interaction.response.send_message("✅ Request sent — an admin will approve you shortly.", ephemeral=True)
+    elif cid == "lead_spend_submit":
+        try: await interaction.response.send_modal(LeadSpendModal())
+        except Exception as e: print("lead modal", e)
     elif cid.startswith("appr_") or cid.startswith("deny_"):
         uid = int(cid.split("_", 1)[1]); member = guild.get_member(uid) if guild else None
         approver = interaction.user
@@ -491,6 +524,7 @@ async def wins_poller():
     save_json(WINS_STATE_FILE, {"seen": seen_list, "init": True})
     if new_posted:
         await check_milestones()
+        await check_quest()
 
 async def check_milestones():
     rec = client.get_channel(RECOGNITION_CH_ID)
@@ -714,6 +748,228 @@ async def ip_poller():
         await post_ip_report()
 
 
+# ---- Lead ROI board -------------------------------------------------------
+def _live_month_key():
+    n = now_pt()
+    return f"{n.year:04d}-{n.month:02d}"
+
+def _kfmt(v):
+    v = float(v or 0)
+    if abs(v) >= 1000: return f"${v/1000:.1f}k"
+    return f"${v:.0f}"
+
+def match_roster(state, name):
+    """Best-effort map a typed name to a canonical roster name."""
+    roster = list(state.get("roster") or [])
+    q = " ".join(str(name or "").split()).strip().lower()
+    if not q: return None
+    low = {r.lower(): r for r in roster}
+    if q in low: return low[q]
+    for r in roster:                                   # startswith / substring
+        if r.lower().startswith(q) or q in r.lower(): return r
+    firsts = {}
+    for r in roster:
+        firsts.setdefault(r.split()[0].lower(), []).append(r)
+    qf = q.split()[0]
+    if qf in firsts and len(firsts[qf]) == 1: return firsts[qf][0]
+    return None
+
+async def fetch_lead_spend(month):
+    url = f"{SUPABASE_URL}/rest/v1/{LEAD_TABLE}"
+    headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
+    params = {"month": f"eq.{month}", "select": "agent,spend,discord_id"}
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, params=params, headers=headers,
+                         timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                print("lead fetch", r.status, (await r.text())[:200]); return {}
+            rows = await r.json()
+    out = {}
+    for row in rows or []:
+        out[str(row.get("agent"))] = _num(row.get("spend"))
+    return out
+
+async def upsert_lead_spend(month, agent, spend, discord_id):
+    url = f"{SUPABASE_URL}/rest/v1/{LEAD_TABLE}?on_conflict=month,agent"
+    headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}",
+               "content-type": "application/json",
+               "Prefer": "resolution=merge-duplicates,return=minimal"}
+    body = {"month": month, "agent": agent, "spend": spend,
+            "discord_id": str(discord_id),
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    async with aiohttp.ClientSession() as s:
+        async with s.post(url, json=body, headers=headers,
+                          timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status not in (200, 201, 204):
+                print("lead upsert", r.status, (await r.text())[:200]); return False
+            return True
+
+class LeadSpendModal(discord.ui.Modal, title="Submit Your Lead Spend"):
+    amount = discord.ui.TextInput(label="Total lead spend THIS MONTH ($)",
+        placeholder="e.g. 2400", required=True, max_length=12)
+    who = discord.ui.TextInput(label="Your name (as on the roster)",
+        placeholder="First Last", required=True, max_length=60)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.amount.value).replace("$", "").replace(",", "").strip()
+        try:
+            spend = float(raw)
+        except Exception:
+            await interaction.response.send_message("⚠️ I couldn't read that as a dollar amount — try just the number, e.g. `2400`.", ephemeral=True); return
+        if spend < 0:
+            await interaction.response.send_message("⚠️ Lead spend can't be negative.", ephemeral=True); return
+        state = await fetch_app_state()
+        if not state:
+            await interaction.response.send_message("⚠️ Couldn't reach the roster right now — try again in a minute.", ephemeral=True); return
+        canon = match_roster(state, str(self.who.value))
+        if not canon:
+            await interaction.response.send_message(
+                f"⚠️ I couldn't match \"{self.who.value}\" to the roster. Try your full name exactly as it appears on the tracker.", ephemeral=True); return
+        month = _live_month_key()
+        ok = await upsert_lead_spend(month, canon, spend, interaction.user.id)
+        if ok:
+            await interaction.response.send_message(
+                f"✅ Logged **${int(round(spend)):,}** in lead spend for **{canon}** this month. Only the totals scoreboard is public — your entry stays private.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ Something went wrong saving that. Ping the owner if it keeps happening.", ephemeral=True)
+
+def lead_button():
+    v = discord.ui.View(timeout=None)
+    v.add_item(discord.ui.Button(label="Submit my lead spend", style=discord.ButtonStyle.success,
+                                 custom_id="lead_spend_submit", emoji="💸"))
+    return v
+
+async def ensure_lead_roi_message():
+    ch = client.get_channel(LEAD_ROI_CH_ID)
+    if not ch: return
+    async for m in ch.history(limit=20):
+        if m.author == client.user and m.components:
+            return
+    e = discord.Embed(title="💸 Lead Spend — private submit",
+        description=("Punch in your **total lead spend for the month** with the button below.\n\n"
+                     "Only **you** see your entry. The scoreboard shows **totals only** — never individual "
+                     "lead orders. Update it anytime; your latest number is what counts."),
+        color=0x1ABC9C)
+    await ch.send(embed=e, view=lead_button())
+
+async def post_lead_roi():
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(LEAD_ROI_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state: return
+    month = _live_month_key(); label = _month_label(month)
+    spends = {a: v for a, v in (await fetch_lead_spend(month)).items() if v and v > 0}
+    if not spends: return                              # nobody submitted yet — no empty board
+    mstart = now_pt().replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc).isoformat()
+    try: deals = await fetch_deals_since(mstart)
+    except Exception as e: print("lead roi deals", e); deals = []
+    byap = summarize_deals(deals)["by"]                # {agent:{deals,apps,ap}}
+    ipmap = _net_map(state, month)                     # {agent: issued IP}
+    rows = []
+    for agent, spend in spends.items():
+        if str(agent).lower() in IP_EXCLUDE: continue
+        ap = byap.get(agent, {}).get("ap", 0.0)
+        ipv = ipmap.get(agent, 0.0)
+        rows.append({"a": agent, "spend": spend, "ap": ap, "ip": ipv,
+                     "apx": (ap / spend) if spend else 0.0, "ipx": (ipv / spend) if spend else 0.0})
+    if not rows: return
+    rows.sort(key=lambda r: r["ap"], reverse=True)     # RESULTS first — biggest writers lead
+    head = f"{'#':<2}{'Rep':<13}{'Spend':>7}{'AP':>8}{'IP':>8}{'AP×':>6}{'IP×':>6}"
+    lines = [head, "─" * len(head)]
+    for i, r in enumerate(rows, 1):
+        nm = r["a"].split()[0][:12]
+        lines.append(f"{i:<2}{nm:<13}{_kfmt(r['spend']):>7}{_kfmt(r['ap']):>8}{_kfmt(r['ip']):>8}"
+                     f"{r['apx']:>5.1f}x{r['ipx']:>5.1f}x")
+    table = "```\n" + "\n".join(lines) + "\n```"
+    e = discord.Embed(title=f"💸 Lead ROI Scoreboard — {label}",
+        description=f"Month-to-date · ranked by AP written · **{len(rows)}** reps reporting\n{table}",
+        color=0x1ABC9C)
+    by_spend = sorted(rows, key=lambda r: r["spend"], reverse=True)
+    top = by_spend[:3]
+    team_ap = sum(r["ap"] for r in rows) or 1.0
+    top_ap = sum(r["ap"] for r in top)
+    e.add_field(name="💡 Spending works",
+        value=(f"Your top {len(top)} lead investors wrote **${int(round(top_ap)):,}** — "
+               f"**{top_ap/team_ap*100:.0f}%** of this board's AP. The reps who spend the most write the most."),
+        inline=False)
+    e.set_footer(text="Excel Financial · AP = submitted (live) · IP = issued from Gateway · totals only")
+    try: await ch.send(embed=e)
+    except Exception as ex: print("lead roi send", ex)
+
+
+# ---- Weekly Quests (results) ----------------------------------------------
+def _week_start_pt():
+    n = now_pt()
+    monday = n - dt.timedelta(days=n.weekday())
+    return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+def _iso_week_key():
+    return now_pt().strftime("%G-W%V")
+
+def pick_quest():
+    return QUESTS[int(now_pt().strftime("%V")) % len(QUESTS)]
+
+def quest_progress(deals):
+    by = {}
+    for d in deals:
+        a = d.get("agent") or "Unknown"
+        e = by.setdefault(a, {"ap": 0.0, "apps": 0, "deals": 0, "maxdeal": 0.0})
+        ap = _num(d.get("ap"))
+        e["ap"] += ap; e["apps"] += int(_num(d.get("apps"))); e["deals"] += 1
+        if ap > e["maxdeal"]: e["maxdeal"] = ap
+    return by
+
+async def announce_quest(q):
+    ch = client.get_channel(QUEST_CH_ID)
+    if not ch: return
+    e = discord.Embed(title=f"{q['emoji']} Weekly Quest — {q['title']}",
+        description=f"{q['desc']}\n\nClear the bar and grab the shoutout. Results only — let's eat. 🍽️",
+        color=0x9B59B6)
+    e.set_footer(text="Excel Financial · resets Monday · everyone who clears it gets the call-out")
+    try: await ch.send(embed=e)
+    except Exception as ex: print("quest announce", ex)
+
+async def check_quest():
+    """Called after new deals post — shout out anyone who just cleared the active quest."""
+    if not SUPABASE_KEY: return
+    qs = load_json(QUEST_STATE_FILE, {})
+    if qs.get("week") != _iso_week_key(): return       # scheduler hasn't opened this week's quest yet
+    q = QUEST_BY_ID.get(qs.get("quest_id"))
+    if not q: return
+    winners = set(qs.get("winners", []))
+    try:
+        deals = await fetch_deals_since(_week_start_pt().astimezone(dt.timezone.utc).isoformat())
+    except Exception as e:
+        print("quest deals", e); return
+    prog = quest_progress(deals)
+    ch = client.get_channel(QUEST_CH_ID)
+    changed = False
+    for agent, p in prog.items():
+        if str(agent).lower() in IP_EXCLUDE: continue
+        if p.get(q["metric"], 0) >= q["goal"] and agent not in winners:
+            winners.add(agent); changed = True
+            if ch:
+                try: await ch.send(f"🎯 **{agent}** just cleared this week's quest — **{q['title']}**! 🔥")
+                except Exception as e: print("quest shout", e)
+    if changed:
+        qs["winners"] = list(winners); save_json(QUEST_STATE_FILE, qs)
+
+async def post_quest_recap():
+    qs = load_json(QUEST_STATE_FILE, {})
+    q = QUEST_BY_ID.get(qs.get("quest_id"))
+    ch = client.get_channel(QUEST_CH_ID)
+    if not (q and ch): return
+    winners = qs.get("winners", [])
+    if winners:
+        desc = "Cleared by " + ", ".join(f"**{w}**" for w in winners) + " 👏"
+    else:
+        desc = "Nobody cleared it this week — new quest drops Monday. Get after it."
+    e = discord.Embed(title=f"{q['emoji']} Quest Recap — {q['title']}", description=desc, color=0x9B59B6)
+    try: await ch.send(embed=e)
+    except Exception as ex: print("quest recap", ex)
+
+
 # ---- scheduler ------------------------------------------------------------
 _last_daily = None
 _last_weekly = None
@@ -722,6 +978,9 @@ _last_weekly = None
 async def on_ready():
     print(f"Logged in as {client.user}.")
     load_state(); await ensure_start_message()
+    if SUPABASE_KEY:
+        try: await ensure_lead_roi_message()
+        except Exception as e: print("lead roi msg", e)
     if not scheduler.is_running(): scheduler.start()
     if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
     if SUPABASE_KEY and not ip_poller.is_running(): ip_poller.start()
@@ -732,8 +991,18 @@ async def scheduler():
     n = now_pt(); ensure_today()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
+    # New week -> open a fresh results quest (once we're into Monday morning)
+    if SUPABASE_KEY:
+        qs = load_json(QUEST_STATE_FILE, {})
+        if qs.get("week") != _iso_week_key() and n.time() >= dt.time(8, 0):
+            q = pick_quest()
+            save_json(QUEST_STATE_FILE, {"week": _iso_week_key(), "quest_id": q["id"], "winners": []})
+            await announce_quest(q)
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
-        _last_weekly = n.date(); await post_weekly()   # recognition now includes weekly deals
+        _last_weekly = n.date()
+        await post_weekly()          # recognition + weekly deals
+        await post_quest_recap()     # who cleared this week's quest
+        await post_lead_roi()        # weekly lead-spend ROI scoreboard
     # IP Reports are import-driven (see ip_poller) — no fixed weekly/monthly schedule.
 
 
