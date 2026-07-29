@@ -80,6 +80,12 @@ MONTHLY_TIME = dt.time(10, 0)   # 1st-of-month reports post at 10 AM PT
 
 ARRIVAL_PINGS = False   # real-time clock-in lines in #attendance-log (data still tracked)
 
+# "Out of rooms" tracking: time NOT in a voice room during the scheduled window
+# (e.g. 9 AM – 6 PM). Lunch, errands, ghosting — it all counts. Used to spot reps who
+# clock in and out on time but don't actually work the day.
+AWAY_FLAG_DAILY_MINS  = 60    # flag a day on the daily card when out this many minutes+
+AWAY_FLAG_WEEK_HOURS  = 4     # auto-flag repeat offenders at this many hours out per 7 days
+
 FLAG_LATE   = 3
 FLAG_EARLY  = 2
 CAMERA_MIN_PCT   = 0.50         # below this % camera-on = flagged
@@ -349,6 +355,26 @@ def is_early_leave(rec):
     cutoff = end_today() or dt.time(18, 0)
     return dt.datetime.fromisoformat(ll).astimezone(PACIFIC).time() < cutoff
 
+def window_span_seconds():
+    """Seconds of the scheduled work window (start -> end) elapsed so far today."""
+    start = scheduled_start_today(); end = end_today()
+    if start is None or end is None: return 0
+    n = now_pt()
+    ws = n.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+    we = n.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
+    cur = min(n, we)
+    return max(0, int((cur - ws).total_seconds()))
+
+def away_today(rec):
+    """Time OUT of the voice rooms during today's work window (lunch and all)."""
+    span = window_span_seconds()
+    if span <= 0: return 0
+    return max(0, span - min(int(live_seconds(rec)), span))
+
+def away_str(sec):
+    sec = int(sec)
+    return f"{sec // 3600}h {(sec % 3600) // 60:02d}m"
+
 
 # ---- voice + camera tracking ---------------------------------------------
 @client.event
@@ -410,37 +436,44 @@ def snapshot_today():
     for mid, rec in today.items():
         snap[mid] = {"name": rec["name"], "seconds": live_seconds(rec),
             "camera_seconds": live_camera(rec), "late": rec["late"],
-            "left_early": is_early_leave(rec), "no_show": False}
+            "left_early": is_early_leave(rec), "no_show": False,
+            "away_seconds": away_today(rec)}
     if guild and start is not None:
         role = guild.get_role(VERIFIED_ROLE_ID)
         if role:
             for m in role.members:
                 if not m.bot and str(m.id) not in snap:
                     snap[str(m.id)] = {"name": m.display_name, "seconds": 0,
-                        "camera_seconds": 0, "late": False, "left_early": False, "no_show": True}
+                        "camera_seconds": 0, "late": False, "left_early": False, "no_show": True,
+                        "away_seconds": window_span_seconds()}
     hist = load_json(HISTORY_FILE, {}); hist[day] = snap; save_json(HISTORY_FILE, hist)
 
 def trailing_counts(days=7):
     hist = load_json(HISTORY_FILE, {}); end = now_pt().date(); counts = {}
+    today_iso = end.isoformat()
     for i in range(days):
         for mid, r in hist.get((end - dt.timedelta(days=i)).isoformat(), {}).items():
-            c = counts.setdefault(mid, {"name": r["name"], "late": 0, "early": 0})
+            c = counts.setdefault(mid, {"name": r["name"], "late": 0, "early": 0, "away": 0.0})
             c["name"] = r["name"]
             if r.get("late"): c["late"] += 1
             if r.get("left_early"): c["early"] += 1
+            if not r.get("no_show"): c["away"] += r.get("away_seconds", 0) / 3600.0
     for mid, rec in today.items():
-        c = counts.setdefault(mid, {"name": rec["name"], "late": 0, "early": 0})
+        if today_iso in hist: break                    # today already snapshotted — don't double-count
+        c = counts.setdefault(mid, {"name": rec["name"], "late": 0, "early": 0, "away": 0.0})
         if rec["late"]: c["late"] += 1
         if is_early_leave(rec): c["early"] += 1
+        c["away"] += away_today(rec) / 3600.0
     return counts
 
 
 # ---- daily report (visual card — every person, color-coded) ---------------
 DAILY_STATUS_COLORS = {"ontime": (46, 204, 113), "late": (241, 196, 15),
                        "early": (230, 126, 34), "late+early": (231, 76, 60),
-                       "noshow": (231, 76, 60)}
+                       "noshow": (231, 76, 60), "gaps": (230, 126, 34)}
 DAILY_STATUS_LABEL  = {"ontime": "ON TIME", "late": "LATE", "early": "LEFT EARLY",
-                       "late+early": "LATE + LEFT EARLY", "noshow": "NO-SHOW"}
+                       "late+early": "LATE + LEFT EARLY", "noshow": "NO-SHOW",
+                       "gaps": "IN-AND-OUT"}
 
 def render_daily_card(day_label, start_label, end_label, rows):
     """rows = [{name, status, detail, hours, cam}] — one row per person, color-coded."""
@@ -466,7 +499,8 @@ def render_daily_card(day_label, start_label, end_label, rows):
         label = DAILY_STATUS_LABEL.get(r["status"], "")
         if r.get("detail"): label += f"  ·  {r['detail']}"
         d.text((84, y + 30), label, font=_card_font(17), fill=col)
-        right = f"{r['hours']:.1f}h · cam {r['cam']*100:.0f}%" if r["hours"] > 0 else "—"
+        right = (f"{r['hours']:.1f}h · out {away_str(r.get('away', 0))} · cam {r['cam']*100:.0f}%"
+                 if r["hours"] > 0 else "—")
         vf = _card_font(22); vw = d.textlength(right, font=vf)
         d.text((W - 56 - vw, y + 6), right, font=vf, fill=CARD_WHITE if r["hours"] > 0 else CARD_DIM)
         d.line([26, y + row_h - 12, W - 26, y + row_h - 12], fill=CARD_LINE, width=1)
@@ -485,16 +519,19 @@ async def post_daily_report():
     rows = []
     for mid, rec in today.items():
         secs = live_seconds(rec); le = is_early_leave(rec); cp = camera_pct(rec)
+        away = away_today(rec)
         if rec["late"] and le: status = "late+early"
         elif rec["late"]:      status = "late"
         elif le:               status = "early"
+        elif away >= AWAY_FLAG_DAILY_MINS * 60: status = "gaps"   # on time both ends, gone in between
         else:                  status = "ontime"
         bits = []
         if rec["late"] and rec.get("first_join"): bits.append(f"in {fmt(rec['first_join'])}")
         if le and rec.get("last_leave"):          bits.append(f"out {fmt(rec['last_leave'])}")
+        if away >= AWAY_FLAG_DAILY_MINS * 60:     bits.append(f"OUT {away_str(away)} of the day")
         if secs >= CAMERA_MIN_MINS*60 and cp < CAMERA_MIN_PCT: bits.append(f"LOW CAM {cp*100:.0f}%")
         rows.append({"name": rec["name"], "status": status, "detail": " · ".join(bits),
-                     "hours": secs/3600.0, "cam": cp})
+                     "hours": secs/3600.0, "cam": cp, "away": away})
     role = guild.get_role(VERIFIED_ROLE_ID) if guild else None
     if role:                                             # every verified member — no-shows included
         for m in role.members:
@@ -502,8 +539,8 @@ async def post_daily_report():
                 rows.append({"name": m.display_name, "status": "noshow", "detail": "never joined a room",
                              "hours": 0.0, "cam": 0.0})
     if not rows: return
-    sev = {"noshow": 0, "late+early": 1, "late": 2, "early": 3, "ontime": 4}
-    rows.sort(key=lambda r: (sev.get(r["status"], 5), -r["hours"]))     # problems on top
+    sev = {"noshow": 0, "late+early": 1, "late": 2, "early": 3, "gaps": 4, "ontime": 5}
+    rows.sort(key=lambda r: (sev.get(r["status"], 6), -r.get("away", 0)))  # problems first, most-out first
     day_label = now_pt().strftime("%A, %B %-d")
     buf = render_daily_card(day_label, start.strftime("%-I:%M %p"), end_t.strftime("%-I:%M %p"), rows)
     problems = sum(1 for r in rows if r["status"] != "ontime")
@@ -529,14 +566,22 @@ async def post_daily_report():
 
 async def post_autoflags(ch, guild):
     counts = trailing_counts(7)
-    flagged = [c for c in counts.values() if c["late"] >= FLAG_LATE or c["early"] >= FLAG_EARLY]
+    flagged = [c for c in counts.values()
+               if c["late"] >= FLAG_LATE or c["early"] >= FLAG_EARLY
+               or c.get("away", 0) >= AWAY_FLAG_WEEK_HOURS]
     if not flagged: return
-    flagged.sort(key=lambda c: c["late"] + c["early"], reverse=True)
+    flagged.sort(key=lambda c: (c["late"] + c["early"], c.get("away", 0)), reverse=True)
+    lines = []
+    for c in flagged:
+        bits = []
+        if c["late"]: bits.append(f"{c['late']} late")
+        if c["early"]: bits.append(f"{c['early']} early")
+        if c.get("away", 0) >= AWAY_FLAG_WEEK_HOURS:
+            bits.append(f"**{c['away']:.1f}h out of rooms** during work hours")
+        lines.append(f"• **{c['name']}** — " + " / ".join(bits) + " (7 days)")
     owner = f"<@{guild.owner_id}> " if guild and guild.owner_id else ""
-    e = discord.Embed(title="🚨 AUTO-FLAG — repeat offenders",
-        description="\n".join(f"• **{c['name']}** — {c['late']} late / {c['early']} early (7 days)" for c in flagged),
-        color=0xC0392B)
-    e.set_footer(text=f"Threshold: {FLAG_LATE}+ late or {FLAG_EARLY}+ early in 7 days")
+    e = discord.Embed(title="🚨 AUTO-FLAG — repeat offenders", description="\n".join(lines), color=0xC0392B)
+    e.set_footer(text=f"Thresholds: {FLAG_LATE}+ late · {FLAG_EARLY}+ early · {AWAY_FLAG_WEEK_HOURS}h+ out of rooms, per 7 days")
     try: await ch.send(content=owner.strip() or None, embed=e)
     except Exception as ex: print("autoflag", ex)
 
@@ -550,9 +595,10 @@ def aggregate_week():
         scheduled = SCHEDULE.get(dt.date.fromisoformat(day).weekday()) is not None
         for mid, r in snap.items():
             a = agg.setdefault(mid, {"name": r["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
-                "present": 0, "late": 0, "early": 0, "noshow": 0})
+                "present": 0, "late": 0, "early": 0, "noshow": 0, "away": 0.0})
             a["name"] = r["name"]; a["hours"] += r.get("seconds", 0)/3600.0
             a["cam"] += r.get("camera_seconds", 0)/3600.0
+            if not r.get("no_show"): a["away"] += r.get("away_seconds", 0)/3600.0
             if scheduled:
                 a["scheduled"] += 1
                 if r.get("no_show"): a["noshow"] += 1
@@ -571,9 +617,10 @@ def aggregate_month():
         scheduled = SCHEDULE.get(dt.date.fromisoformat(day).weekday()) is not None
         for mid, r in snap.items():
             a = agg.setdefault(mid, {"name": r["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
-                "present": 0, "late": 0, "early": 0, "noshow": 0})
+                "present": 0, "late": 0, "early": 0, "noshow": 0, "away": 0.0})
             a["name"] = r["name"]; a["hours"] += r.get("seconds", 0)/3600.0
             a["cam"] += r.get("camera_seconds", 0)/3600.0
+            if not r.get("no_show"): a["away"] += r.get("away_seconds", 0)/3600.0
             if scheduled:
                 a["scheduled"] += 1
                 if r.get("no_show"): a["noshow"] += 1
@@ -1495,11 +1542,12 @@ def compute_excel_scores(state):
         ap = float(prod_low.get(low, 0.0)); used.add(low)
         ontime = max(a["present"] - a["late"], 0)
         pts = round(ap / 1000) + 2*ontime - 2*a["late"] - 2*a["early"] - 4*a["noshow"]
-        rows[nm] = {"pts": pts, "ap": ap, **{k: a[k] for k in ("late", "early", "noshow", "present", "hours", "cam")}}
+        rows[nm] = {"pts": pts, "ap": ap,
+                    **{k: a.get(k, 0) for k in ("late", "early", "noshow", "present", "hours", "cam", "away")}}
     for nm, ap in prod.items():                       # producers with no attendance record yet
         if str(nm).strip().lower() in used: continue
         rows[nm] = {"pts": round(float(ap)/1000), "ap": float(ap),
-                    "late": 0, "early": 0, "noshow": 0, "present": 0, "hours": 0.0, "cam": 0.0}
+                    "late": 0, "early": 0, "noshow": 0, "present": 0, "hours": 0.0, "cam": 0.0, "away": 0.0}
     return rows
 
 async def refresh_accountability_board():
@@ -1512,17 +1560,18 @@ async def refresh_accountability_board():
     rows = compute_excel_scores(state)
     if not rows: return
     order = sorted(rows.items(), key=lambda kv: (kv[1]["late"] + kv[1]["early"] + kv[1]["noshow"],
-                                                 -kv[1]["ap"]), reverse=True)
-    head = f"{'Rep':<14}{'L':>3}{'E':>3}{'NS':>3}{'Hrs':>6}{'Cam':>5}{'AP':>12}{'Sc':>5}"
+                                                 kv[1].get("away", 0), -kv[1]["ap"]), reverse=True)
+    head = f"{'Rep':<13}{'L':>3}{'E':>3}{'NS':>3}{'Hrs':>6}{'Out':>6}{'Cam':>5}{'AP':>12}{'Sc':>4}"
     L = [head, "─" * len(head)]
     for nm, r in order[:25]:
         campct = (r["cam"] / r["hours"] * 100) if r["hours"] else 0
-        L.append(f"{nm[:13]:<14}{r['late']:>3}{r['early']:>3}{r['noshow']:>3}"
-                 f"{r['hours']:>6.1f}{campct:>4.0f}%{'$'+format(r['ap'], ',.2f'):>12}{r['pts']:>5}")
+        L.append(f"{nm[:12]:<13}{r['late']:>3}{r['early']:>3}{r['noshow']:>3}"
+                 f"{r['hours']:>6.1f}{r.get('away', 0):>6.1f}{campct:>4.0f}%"
+                 f"{'$'+format(r['ap'], ',.2f'):>12}{r['pts']:>4}")
     e = discord.Embed(title=f"📋 Accountability Board — {_month_label(_live_month_key())}",
         description=("Worst attendance first · results on the same line\n```\n" + "\n".join(L) + "\n```"),
         color=0xE23B3B)
-    e.set_footer(text="Owner eyes only · L=late E=early leave NS=no-show · Sc=Excel Score · updates daily")
+    e.set_footer(text="Owner eyes only · L=late E=early NS=no-show · Out=hrs out of rooms 9–6 · Sc=Excel Score · daily")
     async for msg in ch.history(limit=40):
         if msg.author == client.user and msg.embeds and (msg.embeds[0].title or "").startswith("📋 Accountability Board"):
             try: await msg.edit(embed=e)
@@ -1593,11 +1642,12 @@ async def cmd_mystats(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     name = interaction.user.display_name
     lines = []
-    row = aggregate_week().get(name)
+    row = next((r for r in aggregate_week().values()
+                if r["name"].strip().lower() == name.strip().lower()), None)
     if row:
         campct = (row["cam"] / row["hours"] * 100) if row["hours"] else 0
-        lines.append(f"**This week:** {row['hours']:.1f}h on the floor · camera {campct:.0f}% · "
-                     f"{row['late']} late · {row['early']} early leave")
+        lines.append(f"**This week:** {row['hours']:.1f}h on the floor · out {row.get('away', 0):.1f}h · "
+                     f"camera {campct:.0f}% · {row['late']} late · {row['early']} early leave")
     else:
         lines.append("**This week:** no floor time logged yet")
     if SUPABASE_KEY:
