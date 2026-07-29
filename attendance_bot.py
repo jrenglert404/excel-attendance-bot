@@ -20,13 +20,19 @@ Excel Financial — Attendance & Culture Bot  (v4)
                    tracker on the month's last drop to post the top-10 cumulative total.
                    The tracker computes the delta & week number; the bot just formats and
                    posts. No fixed schedule. Same SUPABASE_KEY as deals.
-  LEAD ROI       — #lead-roi: reps privately submit their monthly lead spend via a button
-                   + pop-up form; a weekly scoreboard shows spend / AP / IP / AP× / IP×
-                   per rep, ranked by AP written (results-first). Totals only — individual
-                   orders never public. Needs a small Supabase table (setup SQL in README).
+  LEAD ROI       — #lead-roi: reps log each lead ORDER (vendor/type/qty/price) via a button
+                   + pop-up form; the bot keeps a rolling month-to-date tally. Weekly public
+                   scoreboard shows spend / AP / IP / AP× / IP× per rep, ranked by AP written.
+                   Private #lead-report gives the owner a by-type & by-vendor breakdown of
+                   what's being bought. Totals only in public — individual orders stay private.
+                   Needs a small Supabase table (setup SQL in README / lead_spend_setup.sql).
   QUESTS         — #recognition: one rotating RESULTS quest per week (AP / deals / apps /
                    big-case). Auto-tracked from the deals feed; live shoutout when a rep
                    clears it, recap with the Saturday recognition card.
+  TEAM PRODUCTION— #team-production: manager leaderboard. Every rep's production is rolled
+                   up their full upline chain (from the tracker), so each manager shows
+                   self + entire downline. Submitted-AP board edits itself live all month;
+                   an issued-IP team board posts at month end (1st).
 
 Violation POINTS count only late + early. Camera and no-shows are reported for
 awareness but don't add points. Times are Pacific (auto PST/PDT). AFK not counted.
@@ -100,9 +106,17 @@ IP_WEEKLY_N      = 5            # top-N on a weekly (weeks 1-4) board
 IP_MONTHLY_N     = 10           # top-N on the Final MTD (last week) board
 IP_EXCLUDE       = {"jesse englert"}   # names kept off the public board (owner's own pen); lowercase
 
-# --- Lead ROI board: private lead-spend submissions -> public results scoreboard ---
-LEAD_ROI_CH_ID = 1531853384309669960   # #lead-roi
-LEAD_TABLE     = "lead_spend"           # Supabase table (see README for the one-line setup SQL)
+# --- Lead ROI board: reps log each lead ORDER (vendor/type/qty/price); the bot keeps a
+#     rolling monthly tally. Public #lead-roi shows spend-vs-results totals; a private
+#     owner report breaks down by lead type & vendor. ---
+LEAD_ROI_CH_ID    = 1531853384309669960   # #lead-roi  (public totals scoreboard)
+LEAD_REPORT_CH_ID = 1531859358479155220   # #lead-report (owner-only type/vendor breakdown)
+LEAD_TABLE        = "lead_purchases"       # Supabase append-only log (see setup SQL in README)
+
+# --- Team Production: manager leaderboard, each rep's downline rolled up the hierarchy
+#     (uplines come from your tracker). Submitted-AP board auto-updates live all month;
+#     issued-IP team board posts at month end. ---
+TEAM_CH_ID = 1531861880824402000           # #team-production
 
 # --- Weekly Quests: rotating RESULTS challenges, auto-tracked from the deals feed ---
 QUEST_CH_ID     = RECOGNITION_CH_ID     # quests + shoutouts land in #recognition
@@ -454,7 +468,7 @@ async def on_interaction(interaction):
             await reqch.send(embed=e, view=approve_deny_view(u.id))
         await interaction.response.send_message("✅ Request sent — an admin will approve you shortly.", ephemeral=True)
     elif cid == "lead_spend_submit":
-        try: await interaction.response.send_modal(LeadSpendModal())
+        try: await interaction.response.send_modal(LeadOrderModal())
         except Exception as e: print("lead modal", e)
     elif cid.startswith("appr_") or cid.startswith("deny_"):
         uid = int(cid.split("_", 1)[1]); member = guild.get_member(uid) if guild else None
@@ -525,6 +539,7 @@ async def wins_poller():
     if new_posted:
         await check_milestones()
         await check_quest()
+        await refresh_team_ap_board()   # live team-production board follows new deals
 
 async def check_milestones():
     rec = client.get_channel(RECOGNITION_CH_ID)
@@ -774,82 +789,105 @@ def match_roster(state, name):
     if qf in firsts and len(firsts[qf]) == 1: return firsts[qf][0]
     return None
 
-async def fetch_lead_spend(month):
+async def fetch_lead_purchases(month):
+    """Every lead-order row logged this month (append-only)."""
     url = f"{SUPABASE_URL}/rest/v1/{LEAD_TABLE}"
     headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
-    params = {"month": f"eq.{month}", "select": "agent,spend,discord_id"}
+    params = {"month": f"eq.{month}", "select": "agent,vendor,lead_type,quantity,price,discord_id"}
     async with aiohttp.ClientSession() as s:
         async with s.get(url, params=params, headers=headers,
                          timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
-                print("lead fetch", r.status, (await r.text())[:200]); return {}
-            rows = await r.json()
-    out = {}
-    for row in rows or []:
-        out[str(row.get("agent"))] = _num(row.get("spend"))
-    return out
+                print("lead fetch", r.status, (await r.text())[:200]); return []
+            return await r.json() or []
 
-async def upsert_lead_spend(month, agent, spend, discord_id):
-    url = f"{SUPABASE_URL}/rest/v1/{LEAD_TABLE}?on_conflict=month,agent"
+async def insert_lead_purchase(month, agent, vendor, lead_type, quantity, price, discord_id):
+    """Append one lead order — no overwrite; the month's rows sum into a rolling tally."""
+    url = f"{SUPABASE_URL}/rest/v1/{LEAD_TABLE}"
     headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}",
-               "content-type": "application/json",
-               "Prefer": "resolution=merge-duplicates,return=minimal"}
-    body = {"month": month, "agent": agent, "spend": spend,
-            "discord_id": str(discord_id),
-            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+               "content-type": "application/json", "Prefer": "return=minimal"}
+    body = {"month": month, "agent": agent, "vendor": vendor, "lead_type": lead_type,
+            "quantity": quantity, "price": price, "discord_id": str(discord_id),
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat()}
     async with aiohttp.ClientSession() as s:
         async with s.post(url, json=body, headers=headers,
                           timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status not in (200, 201, 204):
-                print("lead upsert", r.status, (await r.text())[:200]); return False
+                print("lead insert", r.status, (await r.text())[:200]); return False
             return True
 
-class LeadSpendModal(discord.ui.Modal, title="Submit Your Lead Spend"):
-    amount = discord.ui.TextInput(label="Total lead spend THIS MONTH ($)",
-        placeholder="e.g. 2400", required=True, max_length=12)
+def _agent_lead_totals(rows):
+    """{agent: {spend, leads, orders}} — the rolling monthly tally per rep."""
+    by = {}
+    for row in rows or []:
+        a = str(row.get("agent"))
+        e = by.setdefault(a, {"spend": 0.0, "leads": 0, "orders": 0})
+        e["spend"] += _num(row.get("price")); e["leads"] += int(_num(row.get("quantity"))); e["orders"] += 1
+    return by
+
+class LeadOrderModal(discord.ui.Modal, title="Log a Lead Order"):
     who = discord.ui.TextInput(label="Your name (as on the roster)",
         placeholder="First Last", required=True, max_length=60)
+    vendor = discord.ui.TextInput(label="Lead vendor",
+        placeholder="e.g. Need-A-Lead, Redbird, iLeads", required=True, max_length=40)
+    lead_type = discord.ui.TextInput(label="Lead type",
+        placeholder="e.g. Final Expense, Mortgage Protection, Aged", required=True, max_length=40)
+    quantity = discord.ui.TextInput(label="Quantity of leads",
+        placeholder="e.g. 50", required=True, max_length=8)
+    price = discord.ui.TextInput(label="Total price spent ($)",
+        placeholder="e.g. 500", required=True, max_length=12)
 
     async def on_submit(self, interaction: discord.Interaction):
-        raw = str(self.amount.value).replace("$", "").replace(",", "").strip()
-        try:
-            spend = float(raw)
-        except Exception:
-            await interaction.response.send_message("⚠️ I couldn't read that as a dollar amount — try just the number, e.g. `2400`.", ephemeral=True); return
-        if spend < 0:
-            await interaction.response.send_message("⚠️ Lead spend can't be negative.", ephemeral=True); return
+        try: await interaction.response.defer(ephemeral=True)
+        except Exception: pass
+        async def reply(msg):
+            try: await interaction.followup.send(msg, ephemeral=True)
+            except Exception as e: print("lead reply", e)
+        praw = str(self.price.value).replace("$", "").replace(",", "").strip()
+        try: price = float(praw)
+        except Exception: return await reply("⚠️ I couldn't read the price — just the number, e.g. `500`.")
+        if price < 0: return await reply("⚠️ Price can't be negative.")
+        qraw = str(self.quantity.value).replace(",", "").strip()
+        try: qty = int(float(qraw))
+        except Exception: return await reply("⚠️ I couldn't read the quantity — a whole number, e.g. `50`.")
+        if qty < 0: return await reply("⚠️ Quantity can't be negative.")
         state = await fetch_app_state()
-        if not state:
-            await interaction.response.send_message("⚠️ Couldn't reach the roster right now — try again in a minute.", ephemeral=True); return
+        if not state: return await reply("⚠️ Couldn't reach the roster right now — try again in a minute.")
         canon = match_roster(state, str(self.who.value))
         if not canon:
-            await interaction.response.send_message(
-                f"⚠️ I couldn't match \"{self.who.value}\" to the roster. Try your full name exactly as it appears on the tracker.", ephemeral=True); return
+            return await reply(f"⚠️ I couldn't match \"{self.who.value}\" to the roster. Use your full name exactly as it appears on the tracker.")
+        vendor = " ".join(str(self.vendor.value).split()).strip()
+        ltype = " ".join(str(self.lead_type.value).split()).strip()
         month = _live_month_key()
-        ok = await upsert_lead_spend(month, canon, spend, interaction.user.id)
-        if ok:
-            await interaction.response.send_message(
-                f"✅ Logged **${int(round(spend)):,}** in lead spend for **{canon}** this month. Only the totals scoreboard is public — your entry stays private.", ephemeral=True)
-        else:
-            await interaction.response.send_message("⚠️ Something went wrong saving that. Ping the owner if it keeps happening.", ephemeral=True)
+        ok = await insert_lead_purchase(month, canon, vendor, ltype, qty, price, interaction.user.id)
+        if not ok:
+            return await reply("⚠️ Something went wrong saving that order. Ping the owner if it keeps happening.")
+        mine = _agent_lead_totals(await fetch_lead_purchases(month)).get(canon, {"spend": price, "leads": qty, "orders": 1})
+        await reply(
+            f"✅ Logged **{qty} {ltype} leads** from **{vendor}** — **${int(round(price)):,}**.\n"
+            f"📊 **{canon}** month-to-date: **${int(round(mine['spend'])):,}** · **{mine['orders']} orders** · **{mine['leads']} leads**.\n"
+            f"Only monthly totals are public — your individual orders stay private.")
 
 def lead_button():
     v = discord.ui.View(timeout=None)
-    v.add_item(discord.ui.Button(label="Submit my lead spend", style=discord.ButtonStyle.success,
+    v.add_item(discord.ui.Button(label="Log a lead order", style=discord.ButtonStyle.success,
                                  custom_id="lead_spend_submit", emoji="💸"))
     return v
 
 async def ensure_lead_roi_message():
     ch = client.get_channel(LEAD_ROI_CH_ID)
     if not ch: return
-    async for m in ch.history(limit=20):
-        if m.author == client.user and m.components:
-            return
-    e = discord.Embed(title="💸 Lead Spend — private submit",
-        description=("Punch in your **total lead spend for the month** with the button below.\n\n"
-                     "Only **you** see your entry. The scoreboard shows **totals only** — never individual "
-                     "lead orders. Update it anytime; your latest number is what counts."),
+    e = discord.Embed(title="💸 Log your lead orders",
+        description=("Bought leads? Hit the button and log the order — **vendor, type, quantity, price**. "
+                     "Do it every time you buy; the bot keeps your **rolling month-to-date total**.\n\n"
+                     "Only **you** see each order. The public scoreboard shows **monthly totals only** — never "
+                     "individual orders."),
         color=0x1ABC9C)
+    async for m in ch.history(limit=20):
+        if m.author == client.user and m.components:   # refresh the existing button message in place
+            try: await m.edit(embed=e, view=lead_button())
+            except Exception as ex: print("lead msg edit", ex)
+            return
     await ch.send(embed=e, view=lead_button())
 
 async def post_lead_roi():
@@ -859,18 +897,18 @@ async def post_lead_roi():
     state = await fetch_app_state()
     if not state: return
     month = _live_month_key(); label = _month_label(month)
-    spends = {a: v for a, v in (await fetch_lead_spend(month)).items() if v and v > 0}
-    if not spends: return                              # nobody submitted yet — no empty board
+    totals = _agent_lead_totals(await fetch_lead_purchases(month))
+    spenders = {a: t for a, t in totals.items() if t["spend"] > 0}
+    if not spenders: return                            # nobody logged yet — no empty board
     mstart = now_pt().replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc).isoformat()
     try: deals = await fetch_deals_since(mstart)
     except Exception as e: print("lead roi deals", e); deals = []
     byap = summarize_deals(deals)["by"]                # {agent:{deals,apps,ap}}
     ipmap = _net_map(state, month)                     # {agent: issued IP}
     rows = []
-    for agent, spend in spends.items():
+    for agent, t in spenders.items():
         if str(agent).lower() in IP_EXCLUDE: continue
-        ap = byap.get(agent, {}).get("ap", 0.0)
-        ipv = ipmap.get(agent, 0.0)
+        spend = t["spend"]; ap = byap.get(agent, {}).get("ap", 0.0); ipv = ipmap.get(agent, 0.0)
         rows.append({"a": agent, "spend": spend, "ap": ap, "ip": ipv,
                      "apx": (ap / spend) if spend else 0.0, "ipx": (ipv / spend) if spend else 0.0})
     if not rows: return
@@ -896,6 +934,40 @@ async def post_lead_roi():
     e.set_footer(text="Excel Financial · AP = submitted (live) · IP = issued from Gateway · totals only")
     try: await ch.send(embed=e)
     except Exception as ex: print("lead roi send", ex)
+
+async def post_lead_report():
+    """Owner-only breakdown of WHAT the team is buying — by lead type and by vendor."""
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(LEAD_REPORT_CH_ID)
+    if not ch: return
+    month = _live_month_key(); label = _month_label(month)
+    purchases = await fetch_lead_purchases(month)
+    if not purchases: return
+    total_spend = sum(_num(r.get("price")) for r in purchases)
+    total_leads = sum(int(_num(r.get("quantity"))) for r in purchases)
+    bytype, byvendor = {}, {}
+    for r in purchases:
+        t = (str(r.get("lead_type") or "").strip() or "—")
+        v = (str(r.get("vendor") or "").strip() or "—")
+        et = bytype.setdefault(t, {"spend": 0.0, "leads": 0})
+        et["spend"] += _num(r.get("price")); et["leads"] += int(_num(r.get("quantity")))
+        ev = byvendor.setdefault(v, {"spend": 0.0, "leads": 0})
+        ev["spend"] += _num(r.get("price")); ev["leads"] += int(_num(r.get("quantity")))
+    def _cpl(d): return (d["spend"] / d["leads"]) if d["leads"] else 0.0
+    tden = total_spend or 1.0
+    type_lines = [f"• **{t}** — ${int(round(d['spend'])):,} ({d['spend']/tden*100:.0f}%) · "
+                  f"{d['leads']} leads · ${_cpl(d):.0f}/lead"
+                  for t, d in sorted(bytype.items(), key=lambda kv: kv[1]["spend"], reverse=True)[:12]]
+    vend_lines = [f"• **{v}** — ${int(round(d['spend'])):,} · {d['leads']} leads · ${_cpl(d):.0f}/lead"
+                  for v, d in sorted(byvendor.items(), key=lambda kv: kv[1]["spend"], reverse=True)[:12]]
+    e = discord.Embed(title=f"🧾 Lead Buying Report — {label}",
+        description=f"**${int(round(total_spend)):,}** spent · **{total_leads:,} leads** · **{len(purchases)} orders** (month-to-date)",
+        color=0xE67E22)
+    e.add_field(name="By lead type", value="\n".join(type_lines) or "—", inline=False)
+    e.add_field(name="By vendor", value="\n".join(vend_lines) or "—", inline=False)
+    e.set_footer(text="Owner-only · what the team is buying · month-to-date")
+    try: await ch.send(embed=e)
+    except Exception as ex: print("lead report send", ex)
 
 
 # ---- Weekly Quests (results) ----------------------------------------------
@@ -970,9 +1042,119 @@ async def post_quest_recap():
     except Exception as ex: print("quest recap", ex)
 
 
+# ---- Team Production (manager downline rollups) ---------------------------
+def _team_rollup(state, prod):
+    """prod = {agent: value}. Credit each producer's value up their full upline chain
+       (self included) so every manager gets self + entire downline. -> {name: team_total}."""
+    uplines = state.get("uplines") or {}
+    team = {}
+    for agent, val in (prod or {}).items():
+        v = float(val or 0)
+        cur, hops, seen = agent, 0, set()
+        while cur and hops < 60 and cur not in seen:
+            seen.add(cur)
+            team[cur] = team.get(cur, 0.0) + v
+            cur = uplines.get(cur); hops += 1
+    return team
+
+def _downline_counts(state):
+    """{manager: number of agents anywhere below them} from the upline tree."""
+    uplines = state.get("uplines") or {}
+    children = {}
+    for a, up in uplines.items():
+        if up: children.setdefault(up, []).append(a)
+    def desc(m, seen):
+        tot = 0
+        for c in children.get(m, []):
+            if c in seen: continue
+            seen.add(c); tot += 1 + desc(c, seen)
+        return tot
+    return {m: desc(m, set()) for m in children}
+
+def _managers(state):
+    """Everyone who is somebody's upline (i.e. actually has a downline)."""
+    uplines = state.get("uplines") or {}
+    roster = set(state.get("roster") or [])
+    return {up for up in uplines.values() if up and (not roster or up in roster)}
+
+def _team_board_embed(state, prod, month_label, *, kind):
+    team = _team_rollup(state, prod)
+    sizes = _downline_counts(state)
+    rows = []
+    for mgr in _managers(state):
+        if str(mgr).lower() in IP_EXCLUDE: continue     # owner's team = everyone; not a ranking
+        tv = team.get(mgr, 0.0)
+        if tv <= 0: continue
+        rows.append({"a": mgr, "team": tv, "own": float(prod.get(mgr, 0) or 0), "size": sizes.get(mgr, 0)})
+    if not rows: return None
+    rows.sort(key=lambda r: r["team"], reverse=True)
+    head = f"{'#':<2}{'Manager':<12}{'Team':>8}{'Own':>7}{'Dn':>4}"
+    lines = [head, "─" * len(head)]
+    for i, r in enumerate(rows, 1):
+        nm = r["a"].split()[0][:11]
+        lines.append(f"{i:<2}{nm:<12}{_kfmt(r['team']):>8}{_kfmt(r['own']):>7}{r['size']:>4}")
+    table = "```\n" + "\n".join(lines) + "\n```"
+    if kind == "ip":
+        title = f"🏅 Team IP — {month_label} (issued, end-of-month)"
+        sub = "Team **issued premium**, rolled up the full hierarchy"
+        color = 0xE67E22
+    else:
+        title = f"🏆 Team Production — {month_label}"
+        sub = "Team **submitted AP**, rolled up the full hierarchy · updates live"
+        color = 0xF1C40F
+    e = discord.Embed(title=title, description=f"{sub}\n{table}", color=color)
+    e.set_footer(text="Team = self + entire downline · Own = personal · Dn = downline headcount")
+    return e
+
+async def refresh_team_ap_board():
+    """Live manager board on SUBMITTED AP — edited in place as deals come in all month."""
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(TEAM_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state: return
+    label = _month_label(_live_month_key())
+    mstart = now_pt().replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc).isoformat()
+    try: deals = await fetch_deals_since(mstart)
+    except Exception as e: print("team ap deals", e); return
+    prod = {a: d["ap"] for a, d in summarize_deals(deals)["by"].items()}
+    e = _team_board_embed(state, prod, label, kind="ap")
+    if not e: return
+    async for m in ch.history(limit=25):
+        if m.author == client.user and m.embeds and (m.embeds[0].title or "").startswith("🏆 Team Production"):
+            try: await m.edit(embed=e)
+            except Exception as ex: print("team edit", ex)
+            return
+    try: await ch.send(embed=e)
+    except Exception as ex: print("team send", ex)
+
+async def post_team_ip_monthly():
+    """End-of-month manager board on ISSUED IP (a fresh post, not an edit)."""
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(TEAM_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state: return
+    months = _months_with_ip(state)
+    if not months: return
+    mkey = months[-1]; label = _month_label(mkey)
+    roster = set(str(x).strip().lower() for x in (state.get("roster") or []))
+    net = ((state.get("months") or {}).get(mkey) or {}).get("net") or {}
+    prod = {}
+    for a, v in net.items():
+        if roster and str(a).strip().lower() not in roster: continue
+        val = _num(v)
+        if val > 0: prod[str(a)] = val
+    e = _team_board_embed(state, prod, label, kind="ip")
+    if not e: return
+    try: await ch.send(embed=e)
+    except Exception as ex: print("team ip send", ex)
+
+
 # ---- scheduler ------------------------------------------------------------
 _last_daily = None
 _last_weekly = None
+_last_team_ip = None
 
 @client.event
 async def on_ready():
@@ -981,14 +1163,19 @@ async def on_ready():
     if SUPABASE_KEY:
         try: await ensure_lead_roi_message()
         except Exception as e: print("lead roi msg", e)
+        try: await refresh_team_ap_board()
+        except Exception as e: print("team board", e)
     if not scheduler.is_running(): scheduler.start()
     if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
     if SUPABASE_KEY and not ip_poller.is_running(): ip_poller.start()
 
 @tasks.loop(seconds=30)
 async def scheduler():
-    global _last_daily, _last_weekly
+    global _last_daily, _last_weekly, _last_team_ip
     n = now_pt(); ensure_today()
+    # End-of-month manager IP board — once, on the 1st
+    if SUPABASE_KEY and n.day == 1 and n.time() >= WEEKLY_TIME and _last_team_ip != (n.year, n.month):
+        _last_team_ip = (n.year, n.month); await post_team_ip_monthly()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
     # New week -> open a fresh results quest (once we're into Monday morning)
@@ -1002,7 +1189,9 @@ async def scheduler():
         _last_weekly = n.date()
         await post_weekly()          # recognition + weekly deals
         await post_quest_recap()     # who cleared this week's quest
-        await post_lead_roi()        # weekly lead-spend ROI scoreboard
+        await post_lead_roi()        # weekly lead-spend ROI scoreboard (public)
+        await post_lead_report()     # lead-buying breakdown by type/vendor (owner-only)
+        await refresh_team_ap_board()  # keep the live manager board fresh weekly too
     # IP Reports are import-driven (see ip_poller) — no fixed weekly/monthly schedule.
 
 
