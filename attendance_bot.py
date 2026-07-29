@@ -504,6 +504,27 @@ def aggregate_week():
                     if r.get("left_early"): a["early"] += 1
     return agg
 
+def aggregate_month():
+    """Month-to-date attendance per member (same shape as aggregate_week)."""
+    hist = load_json(HISTORY_FILE, {}); end = now_pt().date(); agg = {}
+    for i in range(end.day):
+        day = (end - dt.timedelta(days=i)).isoformat(); snap = hist.get(day)
+        if not snap: continue
+        scheduled = SCHEDULE.get(dt.date.fromisoformat(day).weekday()) is not None
+        for mid, r in snap.items():
+            a = agg.setdefault(mid, {"name": r["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
+                "present": 0, "late": 0, "early": 0, "noshow": 0})
+            a["name"] = r["name"]; a["hours"] += r.get("seconds", 0)/3600.0
+            a["cam"] += r.get("camera_seconds", 0)/3600.0
+            if scheduled:
+                a["scheduled"] += 1
+                if r.get("no_show"): a["noshow"] += 1
+                else:
+                    a["present"] += 1
+                    if r.get("late"): a["late"] += 1
+                    if r.get("left_early"): a["early"] += 1
+    return agg
+
 def bar(pct, width=14):
     pct = max(0.0, min(1.0, pct))
     f = int(round(pct * width))
@@ -534,6 +555,19 @@ async def post_sunday_wrap():
         e.add_field(name="⏱️ Top Hours",
             value="\n".join(f"**{i+1}.** {r['name']} — {r['hours']:.1f}h" for i, r in enumerate(top)) or "—",
             inline=False)
+        # Excel Score — month-to-date top 5 (production + attentiveness in one number)
+        try:
+            st_data = await fetch_app_state() if SUPABASE_KEY else None
+            sc = compute_excel_scores(st_data)
+            sc_rows = sorted(((n2, r2["pts"]) for n2, r2 in sc.items()
+                              if str(n2).lower() not in IP_EXCLUDE), key=lambda kv: kv[1], reverse=True)[:5]
+            if sc_rows:
+                e.add_field(name="🏅 Excel Score — month to date",
+                    value="\n".join(f"**{i+1}.** {n2} — {p} pts" for i, (n2, p) in enumerate(sc_rows))
+                          + "\n*+1/$1k AP · +2 on-time day · −2 late/early · −4 no-show*",
+                    inline=False)
+        except Exception as ex:
+            print("wrap score", ex)
         # personal-best weeks (results-only; zero extra messages — lives inside the wrap)
         pb = load_json(PB_FILE, {})
         new_bests = []
@@ -1387,6 +1421,59 @@ async def post_team_ip_monthly():
     except Exception as ex: print("team ip send", ex)
 
 
+# ---- Excel Score + Accountability Board ------------------------------------
+# EXCEL SCORE (monthly, resets on the 1st): production first, attentiveness enforced.
+#   +1 pt per $1,000 submitted AP · +2 per on-time day · −2 per late · −2 per early
+#   leave · −4 per no-show. Public: top 5 in the Sunday Wrap + /mystats. Full table
+#   lives on the owner's private Accountability Board.
+def compute_excel_scores(state):
+    att = aggregate_month()
+    prod = _submitted_ap_by_agent(state, _live_month_key()) if state else {}
+    prod_low = {str(k).strip().lower(): v for k, v in prod.items()}
+    used = set()
+    rows = {}
+    for mid, a in att.items():
+        nm = a["name"]; low = nm.strip().lower()
+        ap = float(prod_low.get(low, 0.0)); used.add(low)
+        ontime = max(a["present"] - a["late"], 0)
+        pts = round(ap / 1000) + 2*ontime - 2*a["late"] - 2*a["early"] - 4*a["noshow"]
+        rows[nm] = {"pts": pts, "ap": ap, **{k: a[k] for k in ("late", "early", "noshow", "present", "hours", "cam")}}
+    for nm, ap in prod.items():                       # producers with no attendance record yet
+        if str(nm).strip().lower() in used: continue
+        rows[nm] = {"pts": round(float(ap)/1000), "ap": float(ap),
+                    "late": 0, "early": 0, "noshow": 0, "present": 0, "hours": 0.0, "cam": 0.0}
+    return rows
+
+async def refresh_accountability_board():
+    """Owner-only bird's-eye: ONE live message in #attendance-log, edited in place daily.
+       Per rep: lates / earlies / no-shows / hours / camera% NEXT TO their AP and Excel
+       Score — so weak results and weak attentiveness sit on the same line."""
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    if not ch: return
+    state = await fetch_app_state() if SUPABASE_KEY else None
+    rows = compute_excel_scores(state)
+    if not rows: return
+    order = sorted(rows.items(), key=lambda kv: (kv[1]["late"] + kv[1]["early"] + kv[1]["noshow"],
+                                                 -kv[1]["ap"]), reverse=True)
+    head = f"{'Rep':<14}{'L':>3}{'E':>3}{'NS':>3}{'Hrs':>6}{'Cam':>5}{'AP':>12}{'Sc':>5}"
+    L = [head, "─" * len(head)]
+    for nm, r in order[:25]:
+        campct = (r["cam"] / r["hours"] * 100) if r["hours"] else 0
+        L.append(f"{nm[:13]:<14}{r['late']:>3}{r['early']:>3}{r['noshow']:>3}"
+                 f"{r['hours']:>6.1f}{campct:>4.0f}%{'$'+format(r['ap'], ',.2f'):>12}{r['pts']:>5}")
+    e = discord.Embed(title=f"📋 Accountability Board — {_month_label(_live_month_key())}",
+        description=("Worst attendance first · results on the same line\n```\n" + "\n".join(L) + "\n```"),
+        color=0xE23B3B)
+    e.set_footer(text="Owner eyes only · L=late E=early leave NS=no-show · Sc=Excel Score · updates daily")
+    async for msg in ch.history(limit=40):
+        if msg.author == client.user and msg.embeds and (msg.embeds[0].title or "").startswith("📋 Accountability Board"):
+            try: await msg.edit(embed=e)
+            except Exception as ex: print("acct edit", ex)
+            return
+    try: await ch.send(embed=e)
+    except Exception as ex: print("acct send", ex)
+
+
 # ---- rank roles ------------------------------------------------------------
 def find_member(name):
     """Best-effort roster-name -> guild member (display name / global name match)."""
@@ -1472,6 +1559,17 @@ async def cmd_mystats(interaction: discord.Interaction):
                              f"AP return {_fmt_x(my_ap, t['spend'])}")
         else:
             lines.append("_Couldn't match your nickname to the roster — set your server nickname to your real name._")
+        try:
+            sc = compute_excel_scores(state)
+            ranked = sorted(((n2, r2["pts"]) for n2, r2 in sc.items()
+                             if str(n2).lower() not in IP_EXCLUDE), key=lambda kv: kv[1], reverse=True)
+            mine = next(((i + 1, p) for i, (n2, p) in enumerate(ranked)
+                         if n2.strip().lower() == name.strip().lower()
+                         or (canon and n2.strip().lower() == canon.strip().lower())), None)
+            if mine:
+                lines.append(f"**Excel Score:** {mine[1]} pts · #{mine[0]} of {len(ranked)}")
+        except Exception as ex:
+            print("mystats score", ex)
     e = discord.Embed(title=f"📊 {name}", description="\n".join(lines), color=0x1ABC9C)
     await interaction.followup.send(embed=e, ephemeral=True)
 
@@ -1630,6 +1728,8 @@ async def on_ready():
         except Exception as e: print("lead roi msg", e)
         try: await refresh_team_ap_board()
         except Exception as e: print("team board", e)
+        try: await refresh_accountability_board()
+        except Exception as e: print("acct board", e)
     if not scheduler.is_running(): scheduler.start()
     if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
     if SUPABASE_KEY and not ip_poller.is_running(): ip_poller.start()
@@ -1644,6 +1744,7 @@ async def scheduler():
         await post_team_ip_monthly(); await post_trend_chart(); await post_ntg_report()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
+        await refresh_accountability_board()   # owner's bird's-eye board follows the daily close
     # Sunday 6 PM PT — the wrap (recognition + streak/PB recap + rank roles) and weekly boards
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
         _last_weekly = n.date()
