@@ -416,6 +416,36 @@ async def on_voice_state_update(member, before, after):
             rec["camera_seconds"] = live_camera(rec); rec["camera_on"] = False
             rec["cam_ts"] = None; save_state()
 
+def sync_current_voice():
+    """On boot: pick up everyone ALREADY sitting in a work room, so a redeploy in the
+       middle of a call session never loses live tracking. Anyone the bot thought had
+       left (or never saw) gets their clock restarted from now."""
+    guild = client.get_guild(GUILD_ID)
+    if not guild: return
+    ensure_today()
+    ts = now_pt(); found = 0
+    for vc in guild.voice_channels:
+        if not is_work_channel(vc): continue
+        for mem in vc.members:
+            if mem.bot: continue
+            mid = str(mem.id); rec = today.get(mid)
+            cam = bool(mem.voice and mem.voice.self_video)
+            if rec is None:
+                start = scheduled_start_today()
+                late = start is not None and ts.time() > start
+                today[mid] = {"name": mem.display_name, "first_join": ts.isoformat(),
+                              "last_leave": None, "enter_ts": ts.isoformat(), "total_seconds": 0.0,
+                              "present": True, "late": late, "camera_on": cam,
+                              "cam_ts": ts.isoformat() if cam else None, "camera_seconds": 0.0}
+                found += 1
+            else:
+                if not rec.get("enter_ts"): rec["enter_ts"] = ts.isoformat(); found += 1
+                rec["present"] = True; rec["last_leave"] = None
+                if cam and not rec.get("camera_on"):
+                    rec["camera_on"] = True; rec["cam_ts"] = ts.isoformat()
+    if found:
+        save_state(); print(f"voice rescan: picked up {found} member(s) already in rooms")
+
 async def announce_arrival(member, ts, late, start):
     """Real-time clock-in lines are OFF (ARRIVAL_PINGS) — arrivals are still tracked and
        land in the daily report + Accountability Board; the log channel stays clean."""
@@ -786,6 +816,13 @@ async def on_interaction(interaction):
         try: await interaction.response.send_modal(LeadOrderModal())
         except Exception as e: print("lead modal", e)
     elif cid.startswith("appr_") or cid.startswith("deny_"):
+        # OWNER-ONLY: nobody else can admit or deny people, no matter what they can see.
+        if not guild or interaction.user.id != guild.owner_id:
+            try:
+                await interaction.response.send_message(
+                    "⛔ Only the owner can approve or deny access requests.", ephemeral=True)
+            except Exception: pass
+            return
         uid = int(cid.split("_", 1)[1]); member = guild.get_member(uid) if guild else None
         approver = interaction.user
         if cid.startswith("appr_"):
@@ -1826,7 +1863,10 @@ _last_monthly = None
 async def on_ready():
     print(f"Logged in as {client.user}.")
     await cloud_pull_state()                       # restore history BEFORE anything reads it
-    load_state(); await ensure_start_message()
+    load_state()
+    try: sync_current_voice()                      # pick up anyone already mid-session
+    except Exception as e: print("voice rescan", e)
+    await ensure_start_message()
     await ensure_bot_avatar()
     try: await tree.sync(guild=discord.Object(GUILD_ID))
     except Exception as e: print("tree sync", e)
