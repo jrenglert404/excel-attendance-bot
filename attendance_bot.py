@@ -1298,9 +1298,26 @@ def _submitted_ap_by_agent(state, mkey):
         if total: out[str(agent)] = total
     return out
 
-def _team_board_embed(state, prod, month_label, *, kind, deal_count=None):
+def _apps_by_agent(state, mkey):
+    """Per-agent app counts for the month, mirroring the tracker's own math:
+       sheet-seeded base count (m.apps) when present, else non-bot chips, plus bot chips."""
+    mo = (state.get("months") or {}).get(mkey) or {}
+    chips_map = mo.get("deals") or {}
+    base_map = mo.get("apps") or {}
+    out = {}
+    for a in set(chips_map) | set(base_map):
+        chips = chips_map.get(a) or []
+        bot_chips = sum(1 for d in chips if d.get("bot"))
+        base = base_map[a] if a in base_map else sum(1 for d in chips if not d.get("bot"))
+        v = int(_num(base)) + bot_chips
+        if v: out[str(a)] = v
+    return out
+
+def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_map=None):
     metric = "IP" if kind == "ip" else "AP"
     team = _team_rollup(state, prod)
+    apps_map = apps_map or {}
+    team_apps = _team_rollup(state, apps_map) if apps_map else {}
     # --- Manager Scoreboard: managers whose DOWNLINE has written business (top 10) ---
     mrows = []
     for mgr in _managers(state):
@@ -1308,11 +1325,11 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None):
         own = float(prod.get(mgr, 0) or 0)
         tv = team.get(mgr, 0.0)
         if (tv - own) <= 0: continue                   # no producing downline -> off the manager board
-        mrows.append((mgr, tv))
+        mrows.append((mgr, tv, int(team_apps.get(mgr, 0))))
     mrows.sort(key=lambda r: r[1], reverse=True)
     mrows = mrows[:10]
-    # --- Individual Scoreboard: top 10 by personal production (owner INCLUDED here) ---
-    irows = [(a, float(v or 0)) for a, v in prod.items() if float(v or 0) > 0]
+    # --- Producer Scoreboard: top 10 by personal production (owner INCLUDED here) ---
+    irows = [(a, float(v or 0), int(apps_map.get(a, 0))) for a, v in prod.items() if float(v or 0) > 0]
     irows.sort(key=lambda r: r[1], reverse=True)
     irows = irows[:10]
     if not mrows and not irows: return None
@@ -1320,32 +1337,33 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None):
     # --- Excel Financial monthly total across the whole floor ---
     floor_total = sum(float(v or 0) for v in prod.values())
     if kind == "ip":
-        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${int(round(floor_total)):,} issued IP**")
+        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${floor_total:,.2f} issued IP**")
     else:
         dtxt = f" · **{deal_count} deals**" if deal_count else ""
         n = now_pt()
         days_in = (dt.date(n.year + (n.month == 12), (n.month % 12) + 1, 1) - dt.date(n.year, n.month, 1)).days
         proj = floor_total / max(n.day, 1) * days_in
-        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${int(round(floor_total)):,} AP**{dtxt}\n"
+        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${floor_total:,.2f} AP**{dtxt}\n"
                       f"📈 Pace: day {n.day}/{days_in} · projecting **${int(round(proj)):,}** by month end")
+    def _pfmt(v): return f"${v:,.2f}"                  # exact, to the penny
     if mrows:
-        head = f"{'#':<3}{'Manager':<20}{'Team '+metric:>9}"
+        head = f"{'#':<3}{'Manager':<20}{'Team '+metric:>14}{'Apps':>6}"
         L = [head, "─" * len(head)]
-        for i, (a, tv) in enumerate(mrows, 1):
-            L.append(f"{i:<3}{a[:19]:<20}{_kfmt(tv):>9}")
+        for i, (a, tv, ap_n) in enumerate(mrows, 1):
+            L.append(f"{i:<3}{a[:19]:<20}{_pfmt(tv):>14}{(ap_n if ap_n else '—'):>6}")
         blocks.append(f"__**👔 Manager Scoreboard — team {metric}**__\n```\n" + "\n".join(L) + "\n```")
     if irows:
-        head = f"{'#':<3}{'Rep':<20}{metric:>9}"
+        head = f"{'#':<3}{'Producer':<20}{metric:>14}{'Apps':>6}"
         L = [head, "─" * len(head)]
-        for i, (a, v) in enumerate(irows, 1):
-            L.append(f"{i:<3}{a[:19]:<20}{_kfmt(v):>9}")
-        blocks.append(f"__**🙋 Individual Scoreboard — personal {metric}**__\n```\n" + "\n".join(L) + "\n```")
+        for i, (a, v, ap_n) in enumerate(irows, 1):
+            L.append(f"{i:<3}{a[:19]:<20}{_pfmt(v):>14}{(ap_n if ap_n else '—'):>6}")
+        blocks.append(f"__**🙋 Producer Scoreboard — personal {metric}**__\n```\n" + "\n".join(L) + "\n```")
     if kind == "ip":
-        title = f"🏅 Team + Individual IP — {month_label} (issued, month-end)"; color = 0xE67E22
+        title = f"🏅 Team IP — {month_label} (issued, month-end)"; color = 0xE67E22
     else:
-        title = f"🏆 Team + Individual Production — {month_label}"; color = 0xF1C40F
+        title = f"🏆 Team Production — {month_label}"; color = 0xF1C40F
     e = discord.Embed(title=title, description="\n".join(blocks), color=color)
-    e.set_footer(text="Manager = whole team rolled up (needs downline production) · Individual = personal · top 10")
+    e.set_footer(text="Manager = whole team rolled up (needs downline production) · Producer = personal · top 10")
     return e
 
 async def refresh_team_ap_board():
@@ -1359,7 +1377,8 @@ async def refresh_team_ap_board():
     prod = _submitted_ap_by_agent(state, mkey)   # canonical names from the tracker -> matches it exactly
     mdeals = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
     deal_count = sum(len(chips or []) for chips in mdeals.values())
-    e = _team_board_embed(state, prod, label, kind="ap", deal_count=deal_count)
+    e = _team_board_embed(state, prod, label, kind="ap", deal_count=deal_count,
+                          apps_map=_apps_by_agent(state, mkey))
     if not e: return
     async for m in ch.history(limit=25):
         if m.author == client.user and m.embeds and (m.embeds[0].title or "").startswith("🏆 Team"):
@@ -1386,7 +1405,10 @@ async def post_team_ip_monthly():
         if roster and str(a).strip().lower() not in roster: continue
         val = _num(v)
         if val > 0: prod[str(a)] = val
-    e = _team_board_embed(state, prod, label, kind="ip")
+    net_apps = ((state.get("months") or {}).get(mkey) or {}).get("netApps") or {}
+    apps_map = {str(a): int(_num(v)) for a, v in net_apps.items()
+                if int(_num(v)) > 0 and (not roster or str(a).strip().lower() in roster)}
+    e = _team_board_embed(state, prod, label, kind="ip", apps_map=apps_map)
     if not e: return
     try: await ch.send(embed=e)
     except Exception as ex: print("team ip send", ex)
@@ -1487,13 +1509,15 @@ async def cmd_leaderboard(interaction: discord.Interaction):
     state = await fetch_app_state()
     if not state: return await interaction.followup.send("Couldn't reach the tracker.", ephemeral=True)
     mkey = _live_month_key(); prod = _submitted_ap_by_agent(state, mkey)
+    apps = _apps_by_agent(state, mkey)
     rows = sorted(((a, v) for a, v in prod.items() if v > 0), key=lambda r: r[1], reverse=True)[:10]
     medals = ["🥇", "🥈", "🥉"]
-    body = "\n".join(f"{medals[i] if i < 3 else f'**{i+1}.**'} {a} — **${int(round(v)):,}**"
+    body = "\n".join(f"{medals[i] if i < 3 else f'**{i+1}.**'} {a} — **${v:,.2f}**"
+                     + (f" · {apps[a]} apps" if apps.get(a) else "")
                      for i, (a, v) in enumerate(rows)) or "No production yet."
     total = sum(prod.values())
-    e = discord.Embed(title=f"🏆 Individual AP — {_month_label(mkey)}",
-        description=body + f"\n\n🏛️ Team total: **${int(round(total)):,}**", color=0xF1C40F)
+    e = discord.Embed(title=f"🏆 Producer Scoreboard — {_month_label(mkey)}",
+        description=body + f"\n\n🏛️ Team total: **${total:,.2f}**", color=0xF1C40F)
     await interaction.followup.send(embed=e, ephemeral=True)
 
 @tree.command(name="team", description="This month's top managers by team AP (private view)", guild=discord.Object(GUILD_ID))
@@ -1509,7 +1533,7 @@ async def cmd_team(interaction: discord.Interaction):
             and (team.get(mgr, 0) - float(prod.get(mgr, 0) or 0)) > 0]
     rows.sort(key=lambda r: r[1], reverse=True)
     medals = ["🥇", "🥈", "🥉"]
-    body = "\n".join(f"{medals[i] if i < 3 else f'**{i+1}.**'} {a} — **${int(round(v)):,}**"
+    body = "\n".join(f"{medals[i] if i < 3 else f'**{i+1}.**'} {a} — **${v:,.2f}**"
                      for i, (a, v) in enumerate(rows[:10])) or "No team production yet."
     e = discord.Embed(title=f"👔 Manager Scoreboard — {_month_label(mkey)}", description=body, color=0x9B59B6)
     await interaction.followup.send(embed=e, ephemeral=True)
