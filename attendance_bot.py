@@ -1079,10 +1079,20 @@ def _managers(state):
     roster = set(state.get("roster") or [])
     return {up for up in uplines.values() if up and (not roster or up in roster)}
 
+def _submitted_ap_by_agent(state, mkey):
+    """Per-agent submitted AP for the month, summed from the tracker's OWN deal chips in
+       app_state (state.months[mkey].deals). These use canonical/aliased names that match
+       the upline tree, so rollups match the tracker exactly — unlike the raw deals table."""
+    mdeals = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
+    out = {}
+    for agent, chips in mdeals.items():
+        total = sum(_num(d.get("a")) for d in (chips or []))
+        if total: out[str(agent)] = total
+    return out
+
 def _team_board_embed(state, prod, month_label, *, kind):
     metric = "IP" if kind == "ip" else "AP"
     team = _team_rollup(state, prod)
-    sizes = _downline_counts(state)
     # --- Manager Scoreboard: managers whose DOWNLINE has written business (top 10) ---
     mrows = []
     for mgr in _managers(state):
@@ -1090,8 +1100,8 @@ def _team_board_embed(state, prod, month_label, *, kind):
         own = float(prod.get(mgr, 0) or 0)
         tv = team.get(mgr, 0.0)
         if (tv - own) <= 0: continue                   # no producing downline -> off the manager board
-        mrows.append({"a": mgr, "team": tv, "own": own, "size": sizes.get(mgr, 0)})
-    mrows.sort(key=lambda r: r["team"], reverse=True)
+        mrows.append((mgr, tv))
+    mrows.sort(key=lambda r: r[1], reverse=True)
     mrows = mrows[:10]
     # --- Individual Scoreboard: top 10 by personal production ---
     irows = [(a, float(v or 0)) for a, v in prod.items()
@@ -1101,23 +1111,23 @@ def _team_board_embed(state, prod, month_label, *, kind):
     if not mrows and not irows: return None
     blocks = []
     if mrows:
-        head = f"{'#':<2}{'Manager':<12}{'Team':>8}{'Own':>7}{'Dn':>4}"
+        head = f"{'#':<3}{'Manager':<20}{'Team '+metric:>9}"
         L = [head, "─" * len(head)]
-        for i, r in enumerate(mrows, 1):
-            L.append(f"{i:<2}{r['a'].split()[0][:11]:<12}{_kfmt(r['team']):>8}{_kfmt(r['own']):>7}{r['size']:>4}")
+        for i, (a, tv) in enumerate(mrows, 1):
+            L.append(f"{i:<3}{a[:19]:<20}{_kfmt(tv):>9}")
         blocks.append(f"__**👔 Manager Scoreboard — team {metric}**__\n```\n" + "\n".join(L) + "\n```")
     if irows:
-        head = f"{'#':<2}{'Rep':<13}{metric:>8}"
+        head = f"{'#':<3}{'Rep':<20}{metric:>9}"
         L = [head, "─" * len(head)]
         for i, (a, v) in enumerate(irows, 1):
-            L.append(f"{i:<2}{a.split()[0][:12]:<13}{_kfmt(v):>8}")
+            L.append(f"{i:<3}{a[:19]:<20}{_kfmt(v):>9}")
         blocks.append(f"__**🙋 Individual Scoreboard — personal {metric}**__\n```\n" + "\n".join(L) + "\n```")
     if kind == "ip":
         title = f"🏅 Team + Individual IP — {month_label} (issued, month-end)"; color = 0xE67E22
     else:
         title = f"🏆 Team + Individual Production — {month_label}"; color = 0xF1C40F
     e = discord.Embed(title=title, description="\n".join(blocks), color=color)
-    e.set_footer(text="Manager = self + downline (needs downline production) · Individual = personal · top 10 · auto-updates")
+    e.set_footer(text="Manager = whole team rolled up (needs downline production) · Individual = personal · top 10")
     return e
 
 async def refresh_team_ap_board():
@@ -1127,11 +1137,8 @@ async def refresh_team_ap_board():
     if not ch: return
     state = await fetch_app_state()
     if not state: return
-    label = _month_label(_live_month_key())
-    mstart = now_pt().replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc).isoformat()
-    try: deals = await fetch_deals_since(mstart)
-    except Exception as e: print("team ap deals", e); return
-    prod = {a: d["ap"] for a, d in summarize_deals(deals)["by"].items()}
+    mkey = _live_month_key(); label = _month_label(mkey)
+    prod = _submitted_ap_by_agent(state, mkey)   # canonical names from the tracker -> matches it exactly
     e = _team_board_embed(state, prod, label, kind="ap")
     if not e: return
     async for m in ch.history(limit=25):
