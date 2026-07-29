@@ -26,9 +26,9 @@ Excel Financial — Attendance & Culture Bot  (v4)
                    Private #lead-report gives the owner a by-type & by-vendor breakdown of
                    what's being bought. Totals only in public — individual orders stay private.
                    Needs a small Supabase table (setup SQL in README / lead_spend_setup.sql).
-  QUESTS         — #recognition: one rotating RESULTS quest per week (AP / deals / apps /
-                   big-case). Auto-tracked from the deals feed; live shoutout when a rep
-                   clears it, recap with the Saturday recognition card.
+  STREAKS & PBs  — results-only, minimum messages: ONE line when a rep hits a milestone
+                   run of consecutive closing days (3/5/7/10...), and personal-best weeks
+                   listed inside the Sunday Wrap (no extra posts). No quests.
   TEAM PRODUCTION— #team-production: two top-10 boards in one auto-updating post — a
                    MANAGER SCOREBOARD (each rep's downline rolled up their full upline
                    chain from the tracker; only managers whose downline has written
@@ -218,23 +218,14 @@ async def ensure_bot_avatar():
         print("avatar", e)
 
 # --- Weekly Quests: rotating RESULTS challenges, auto-tracked from the deals feed ---
-QUEST_CH_ID     = RECOGNITION_CH_ID     # quests + shoutouts land in #recognition
-QUEST_STATE_FILE = "quest_state.json"
-# Every quest is results-only. One runs per ISO week, rotating in order. Anyone who
-# clears the bar gets a live shoutout; a recap posts with the weekly recognition card.
-QUESTS = [
-    {"id": "ap10k",  "emoji": "💵", "title": "$10K AP Week",   "metric": "ap",      "goal": 10000,
-     "desc": "Write **$10,000+ submitted AP** this week."},
-    {"id": "deals5", "emoji": "🔥", "title": "5-Deal Week",    "metric": "deals",   "goal": 5,
-     "desc": "Close **5+ deals** this week."},
-    {"id": "big3k",  "emoji": "🐘", "title": "Big Case Bounty", "metric": "maxdeal", "goal": 3000,
-     "desc": "Close a **single policy worth $3,000+ AP** this week."},
-    {"id": "apps15", "emoji": "⚡", "title": "15-App Week",     "metric": "apps",    "goal": 15,
-     "desc": "Submit **15+ apps** this week."},
-    {"id": "ap20k",  "emoji": "🚀", "title": "$20K AP Club",    "metric": "ap",      "goal": 20000,
-     "desc": "Write **$20,000+ submitted AP** this week."},
-]
-QUEST_BY_ID = {q["id"]: q for q in QUESTS}
+# --- Streaks & personal bests: RESULTS-ONLY, minimum messages. -----------------
+# A streak = consecutive workdays (Sun ignored) with at least one closed deal.
+# The bot posts ONE line only when a rep crosses a milestone run — never daily.
+# Personal-best weeks get a line INSIDE the Sunday Wrap (zero extra messages).
+STREAK_CH_ID     = RECOGNITION_CH_ID
+STREAK_FILE      = "streak_state.json"
+PB_FILE          = "pb_state.json"
+STREAK_MILESTONES = [3, 5, 7, 10, 15, 20, 30]
 
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -519,7 +510,7 @@ def bar(pct, width=14):
     return "█" * f + "░" * (width - f)
 
 async def post_sunday_wrap():
-    """ONE consolidated public post (Sunday 6 PM PT): recognition + quest recap + card.
+    """ONE consolidated public post (Sunday 6 PM PT): recognition + personal bests + card.
        Also awards the weekly rank roles. Private accountability posts separately below."""
     agg = aggregate_week()
     rows = list(agg.values())
@@ -543,14 +534,22 @@ async def post_sunday_wrap():
         e.add_field(name="⏱️ Top Hours",
             value="\n".join(f"**{i+1}.** {r['name']} — {r['hours']:.1f}h" for i, r in enumerate(top)) or "—",
             inline=False)
-        # quest recap folded in
-        qs = load_json(QUEST_STATE_FILE, {})
-        q = QUEST_BY_ID.get(qs.get("quest_id"))
-        if q:
-            winners = qs.get("winners", [])
-            qtxt = (", ".join(f"**{w}**" for w in winners) + " 👏") if winners \
-                   else "Nobody cleared it — new quest drops Monday."
-            e.add_field(name=f"{q['emoji']} Quest — {q['title']}", value=qtxt, inline=False)
+        # personal-best weeks (results-only; zero extra messages — lives inside the wrap)
+        pb = load_json(PB_FILE, {})
+        new_bests = []
+        for a, s in ds["by"].items():
+            if str(a).lower() in IP_EXCLUDE: continue
+            wk_ap = float(s["ap"])
+            prev = float(pb.get(a, 0))
+            if prev > 0 and wk_ap > prev:
+                new_bests.append((a, wk_ap, prev))
+            if wk_ap > prev: pb[a] = wk_ap
+        save_json(PB_FILE, pb)
+        if new_bests:
+            new_bests.sort(key=lambda r: r[1], reverse=True)
+            e.add_field(name="🚀 New Personal Bests",
+                value="\n".join(f"• **{a}** — ${v:,.2f} (old best ${p:,.2f})" for a, v, p in new_bests[:8]),
+                inline=False)
         deal_names = set(str(n).strip().lower() for n in ds["by"])
         warm = [r["name"] for r in rows if r["hours"] >= 5 and r["name"].strip().lower() not in deal_names]
         if warm:
@@ -704,18 +703,21 @@ async def wins_poller():
     init = data.get("init", False)
     order = sorted(deals, key=lambda d: d.get("posted_at") or "")  # oldest first
     new_posted = False
+    new_agents = []
     for d in order:
         did = str(d.get("id"))
         if did in seen: continue
         if init:
-            try: await ch.send(fmt_deal(d)); new_posted = True
+            try:
+                await ch.send(fmt_deal(d)); new_posted = True
+                if d.get("agent"): new_agents.append(str(d["agent"]))
             except Exception as e: print("wins send", e)
         seen.add(did)
     seen_list = list(seen)[-1000:]
     save_json(WINS_STATE_FILE, {"seen": seen_list, "init": True})
     if new_posted:
         await check_milestones()
-        await check_quest()
+        await check_streaks(new_agents)
         await refresh_team_ap_board()   # live team-production board follows new deals
 
 async def check_milestones():
@@ -1186,70 +1188,41 @@ def _week_start_pt():
     monday = n - dt.timedelta(days=n.weekday())
     return monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
-def _iso_week_key():
-    return now_pt().strftime("%G-W%V")
-
-def pick_quest():
-    return QUESTS[int(now_pt().strftime("%V")) % len(QUESTS)]
-
-def quest_progress(deals):
-    by = {}
-    for d in deals:
-        a = d.get("agent") or "Unknown"
-        e = by.setdefault(a, {"ap": 0.0, "apps": 0, "deals": 0, "maxdeal": 0.0})
-        ap = _num(d.get("ap"))
-        e["ap"] += ap; e["apps"] += int(_num(d.get("apps"))); e["deals"] += 1
-        if ap > e["maxdeal"]: e["maxdeal"] = ap
-    return by
-
-async def announce_quest(q):
-    ch = client.get_channel(QUEST_CH_ID)
-    if not ch: return
-    e = discord.Embed(title=f"{q['emoji']} Weekly Quest — {q['title']}",
-        description=f"{q['desc']}\n\nClear the bar and grab the shoutout. Results only — let's eat. 🍽️",
-        color=0x9B59B6)
-    e.set_footer(text="Excel Financial · resets Monday · everyone who clears it gets the call-out")
-    try: await ch.send(embed=e)
-    except Exception as ex: print("quest announce", ex)
-
-async def check_quest():
-    """Called after new deals post — shout out anyone who just cleared the active quest."""
-    if not SUPABASE_KEY: return
-    qs = load_json(QUEST_STATE_FILE, {})
-    if qs.get("week") != _iso_week_key(): return       # scheduler hasn't opened this week's quest yet
-    q = QUEST_BY_ID.get(qs.get("quest_id"))
-    if not q: return
-    winners = set(qs.get("winners", []))
-    try:
-        deals = await fetch_deals_since(_week_start_pt().astimezone(dt.timezone.utc).isoformat())
-    except Exception as e:
-        print("quest deals", e); return
-    prog = quest_progress(deals)
-    ch = client.get_channel(QUEST_CH_ID)
+async def check_streaks(new_agents):
+    """Called with the agents on newly-posted deals. Tracks consecutive closing WORKDAYS
+       (Sundays ignored) and posts ONE line only at milestone runs — never daily."""
+    if not new_agents: return
+    st = load_json(STREAK_FILE, {})
+    today = now_pt().date()
+    ch = client.get_channel(STREAK_CH_ID)
     changed = False
-    for agent, p in prog.items():
+    for agent in set(new_agents):
         if str(agent).lower() in IP_EXCLUDE: continue
-        if p.get(q["metric"], 0) >= q["goal"] and agent not in winners:
-            winners.add(agent); changed = True
-            if ch:
-                try: await ch.send(f"🎯 **{agent}** just cleared this week's quest — **{q['title']}**! 🔥")
-                except Exception as e: print("quest shout", e)
-    if changed:
-        qs["winners"] = list(winners); save_json(QUEST_STATE_FILE, qs)
-
-async def post_quest_recap():
-    qs = load_json(QUEST_STATE_FILE, {})
-    q = QUEST_BY_ID.get(qs.get("quest_id"))
-    ch = client.get_channel(QUEST_CH_ID)
-    if not (q and ch): return
-    winners = qs.get("winners", [])
-    if winners:
-        desc = "Cleared by " + ", ".join(f"**{w}**" for w in winners) + " 👏"
-    else:
-        desc = "Nobody cleared it this week — new quest drops Monday. Get after it."
-    e = discord.Embed(title=f"{q['emoji']} Quest Recap — {q['title']}", description=desc, color=0x9B59B6)
-    try: await ch.send(embed=e)
-    except Exception as ex: print("quest recap", ex)
+        rec = st.get(agent) or {"last": None, "len": 0, "hit": []}
+        if rec["last"] == today.isoformat(): continue          # already counted today
+        if rec["last"]:
+            try: prev = dt.date.fromisoformat(rec["last"])
+            except Exception: prev = None
+            missed = 0
+            if prev:
+                d = prev + dt.timedelta(days=1)
+                while d < today:
+                    if d.weekday() != 6: missed += 1           # Sundays never break a streak
+                    d += dt.timedelta(days=1)
+            if prev and missed == 0:
+                rec["len"] += 1
+            else:
+                rec["len"] = 1; rec["hit"] = []
+        else:
+            rec["len"] = 1; rec["hit"] = []
+        rec["last"] = today.isoformat()
+        new_ms = [ms for ms in STREAK_MILESTONES if rec["len"] >= ms and ms not in rec["hit"]]
+        if new_ms and ch:
+            ms = max(new_ms); rec["hit"] = sorted(set(rec["hit"]) | set(new_ms))
+            try: await ch.send(f"🔥 **{agent}** — **{rec['len']} straight closing days.** Keep stacking.")
+            except Exception as e: print("streak", e)
+        st[agent] = rec; changed = True
+    if changed: save_json(STREAK_FILE, st)
 
 
 # ---- Team Production (manager downline rollups) ---------------------------
@@ -1671,14 +1644,7 @@ async def scheduler():
         await post_team_ip_monthly(); await post_trend_chart(); await post_ntg_report()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
-    # New week -> open a fresh results quest (once we're into Monday morning)
-    if SUPABASE_KEY:
-        qs = load_json(QUEST_STATE_FILE, {})
-        if qs.get("week") != _iso_week_key() and n.time() >= dt.time(8, 0):
-            q = pick_quest()
-            save_json(QUEST_STATE_FILE, {"week": _iso_week_key(), "quest_id": q["id"], "winners": []})
-            await announce_quest(q)
-    # Sunday 6 PM PT — the wrap (recognition + quest recap + rank roles) and weekly boards
+    # Sunday 6 PM PT — the wrap (recognition + streak/PB recap + rank roles) and weekly boards
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
         _last_weekly = n.date()
         await post_sunday_wrap()       # ONE public wrap + private accountability + roles
