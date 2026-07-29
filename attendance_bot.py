@@ -78,6 +78,8 @@ WEEKLY_TIME = dt.time(18, 0)
 WEEKLY_DAY  = 6                 # Sunday — the 6 PM PT "Sunday Wrap"
 MONTHLY_TIME = dt.time(10, 0)   # 1st-of-month reports post at 10 AM PT
 
+ARRIVAL_PINGS = False   # real-time clock-in lines in #attendance-log (data still tracked)
+
 FLAG_LATE   = 3
 FLAG_EARLY  = 2
 CAMERA_MIN_PCT   = 0.50         # below this % camera-on = flagged
@@ -389,6 +391,9 @@ async def on_voice_state_update(member, before, after):
             rec["cam_ts"] = None; save_state()
 
 async def announce_arrival(member, ts, late, start):
+    """Real-time clock-in lines are OFF (ARRIVAL_PINGS) — arrivals are still tracked and
+       land in the daily report + Accountability Board; the log channel stays clean."""
+    if not ARRIVAL_PINGS: return
     ch = client.get_channel(LOG_CHANNEL_ID)
     if not ch: return
     msg = (f"🔴 **LATE** — {member.mention} clocked in at **{fmt(ts)}** "
