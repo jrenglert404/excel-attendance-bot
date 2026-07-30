@@ -500,7 +500,7 @@ def trailing_counts(days=7):
 # ---- daily report (visual card — every person, color-coded) ---------------
 DAILY_STATUS_COLORS = {"ontime": (46, 204, 113), "late": (241, 196, 15),
                        "early": (230, 126, 34), "late+early": (231, 76, 60),
-                       "noshow": (231, 76, 60), "gaps": (230, 126, 34)}
+                       "noshow": (231, 76, 60), "gaps": (155, 89, 182)}
 DAILY_STATUS_LABEL  = {"ontime": "ON TIME", "late": "LATE", "early": "LEFT EARLY",
                        "late+early": "LATE + LEFT EARLY", "noshow": "NO-SHOW",
                        "gaps": "IN-AND-OUT"}
@@ -787,6 +787,31 @@ def approve_deny_view(uid):
     v.add_item(discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger, custom_id=f"deny_{uid}", emoji="⛔"))
     return v
 
+async def send_onboarding_dm(member):
+    """One DM the moment a rep is approved — the house rules, identically every time."""
+    e = discord.Embed(title="🦁 Welcome to Excel Financial",
+        description=(
+            "You're verified — here's how the floor runs. Read this once and you're set.\n\n"
+            "**1. Set your server nickname to your REAL NAME** (right-click the server icon → "
+            "Edit Server Profile). This is how your production, stats, and weekly awards find you — "
+            "wrong nickname, no credit.\n\n"
+            "**2. Camera on, on time.** Call sessions run in the voice rooms — the schedule lives in "
+            f"<#{1531671450220630166}>. Attendance and camera are tracked automatically.\n\n"
+            f"**3. Your results post themselves.** Deals hit <#{WINS_CHANNEL_ID}> live, leaderboards "
+            f"update in <#{TEAM_CH_ID}>, and the weekly wrap drops Sundays in <#{RECOGNITION_CH_ID}>.\n\n"
+            f"**4. Buy leads? Log every order** with the button in <#{LEAD_ROI_CH_ID}> — vendor, type, "
+            "quantity, price. Takes 20 seconds and puts you on the ROI board.\n\n"
+            f"**5. Check your own numbers anytime** — type `/mystats` in <#{COMMANDS_CH_ID}>. Only you "
+            "see the answer.\n\n"
+            "Results get rewarded here — 💰 Closer of the Week, 📈 Top IP, streak call-outs. "
+            "Show up, stay on, write business. 🔥"),
+        color=0xF1C40F)
+    e.set_footer(text="Excel Financial · this is an automated welcome — questions go to the owner")
+    try:
+        await member.send(embed=e)
+    except Exception as e2:
+        print("onboarding dm (likely DMs closed)", e2)
+
 async def ensure_start_message():
     ch = client.get_channel(START_HERE_CHANNEL_ID)
     if not ch: return
@@ -830,6 +855,7 @@ async def on_interaction(interaction):
             if member and role:
                 try: await member.add_roles(role, reason=f"Approved by {approver}")
                 except Exception as e: print("grant", e)
+                await send_onboarding_dm(member)
             txt = f"✅ Approved by {approver.mention}"
         else:
             txt = f"⛔ Denied by {approver.mention}"
@@ -1608,7 +1634,19 @@ async def refresh_accountability_board():
     e = discord.Embed(title=f"📋 Accountability Board — {_month_label(_live_month_key())}",
         description=("Worst attendance first · results on the same line\n```\n" + "\n".join(L) + "\n```"),
         color=0xE23B3B)
-    e.set_footer(text="Owner eyes only · L=late E=early NS=no-show · Out=hrs out of rooms 9–6 · Sc=Excel Score · daily")
+    # nickname audit — anyone the data can't match is a silent hole in the stats
+    if state:
+        guild = client.get_guild(GUILD_ID)
+        vrole = guild.get_role(VERIFIED_ROLE_ID) if guild else None
+        if vrole:
+            bad = [mm.display_name for mm in vrole.members
+                   if not mm.bot and mm.id != guild.owner_id
+                   and not match_roster(state, mm.display_name)]
+            if bad:
+                e.add_field(name=f"⚠️ Nickname ≠ roster ({len(bad)}) — their stats can't link up",
+                    value="\n".join("• " + n for n in bad[:12]) + ("\n…" if len(bad) > 12 else ""),
+                    inline=False)
+    e.set_footer(text="Owner + trainers · L=late E=early NS=no-show · Out=hrs out of rooms 9–6 · Sc=Excel Score · daily")
     async for msg in ch.history(limit=40):
         if msg.author == client.user and msg.embeds and (msg.embeds[0].title or "").startswith("📋 Accountability Board"):
             try: await msg.edit(embed=e)
@@ -1616,6 +1654,117 @@ async def refresh_accountability_board():
             return
     try: await ch.send(embed=e)
     except Exception as ex: print("acct send", ex)
+
+
+# ---- Weekly Attendance Matrix (owner + trainers, #attendance-log) ----------
+def _blend(c, a=0.42, bg=CARD_BLACK):
+    return tuple(int(c[i] * a + bg[i] * (1 - a)) for i in range(3))
+
+def render_week_matrix(week_label, days, people):
+    """people = [{name, cells:[{status,hours}...] per day, tot_h, tot_out, cam, l, e, ns}]
+       One row per person, one colored cell per day, totals on the right."""
+    if not HAVE_PIL or not people: return None
+    NAME_W = 200; CELL_W = 92; TOT_W = 345; ROW_H = 46; TOP = 168
+    W = 40 + NAME_W + CELL_W * len(days) + TOT_W + 40
+    H = TOP + ROW_H * len(people) + 118
+    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
+    tx = 44
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo = Image.open(LOGO_FILE).convert("RGBA").resize((92, 92), Image.LANCZOS)
+            img.paste(logo, (40, 30), logo); tx = 152
+        except Exception: pass
+    d.text((tx, 40), "WEEKLY ATTENDANCE", font=_card_font(36, True), fill=CARD_GOLD)
+    d.text((tx, 90), week_label, font=_card_font(21), fill=CARD_WHITE)
+    # column headers
+    hy = TOP - 34
+    for i, day in enumerate(days):
+        x = 40 + NAME_W + i * CELL_W
+        lbl = day.strftime("%a").upper()
+        f = _card_font(18, True); lw = d.textlength(lbl, font=f)
+        d.text((x + (CELL_W - lw) / 2, hy), lbl, font=f, fill=CARD_DIM)
+    d.text((40 + NAME_W + len(days) * CELL_W + 16, hy), "WEEK TOTALS", font=_card_font(18, True), fill=CARD_DIM)
+    y = TOP
+    for p in people:
+        d.text((44, y + 10), p["name"][:16], font=_card_font(22, True), fill=CARD_WHITE)
+        for i, c in enumerate(p["cells"]):
+            x = 40 + NAME_W + i * CELL_W
+            col = DAILY_STATUS_COLORS.get(c["status"])
+            if c["status"] == "none":
+                d.text((x + CELL_W/2 - 6, y + 10), "—", font=_card_font(20), fill=(70, 70, 76))
+            else:
+                d.rounded_rectangle([x + 4, y + 3, x + CELL_W - 8, y + ROW_H - 9], radius=7, fill=_blend(col))
+                txt = f"{c['hours']:.1f}"
+                f = _card_font(19, True); tw = d.textlength(txt, font=f)
+                d.text((x + (CELL_W - 4 - tw) / 2, y + 11), txt, font=f, fill=(235, 235, 235))
+        tot = (f"{p['tot_h']:.1f}h · out {p['tot_out']:.1f}h · cam {p['cam']*100:.0f}%"
+               + (f" · {p['l']}L" if p['l'] else "") + (f" {p['e']}E" if p['e'] else "")
+               + (f" {p['ns']}NS" if p['ns'] else ""))
+        d.text((40 + NAME_W + len(days) * CELL_W + 16, y + 12), tot, font=_card_font(18), fill=CARD_WHITE)
+        d.line([36, y + ROW_H - 4, W - 36, y + ROW_H - 4], fill=CARD_LINE, width=1)
+        y += ROW_H
+    # legend
+    ly = H - 84
+    lx = 44
+    for status, lbl in (("ontime", "ON TIME"), ("late", "LATE"), ("early", "LEFT EARLY"),
+                        ("late+early", "BOTH"), ("noshow", "NO-SHOW"), ("gaps", "IN-AND-OUT")):
+        col = DAILY_STATUS_COLORS[status]
+        d.rounded_rectangle([lx, ly, lx + 26, ly + 18], radius=5, fill=_blend(col))
+        f = _card_font(16); d.text((lx + 34, ly), lbl, font=f, fill=CARD_DIM)
+        lx += 34 + d.textlength(lbl, font=f) + 26
+    d.text((44, H - 48), "cell number = hours in rooms that day · owner + trainers only · EXCEL FINANCIAL",
+           font=_card_font(16), fill=CARD_DIM)
+    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
+    return buf
+
+async def post_weekly_attendance():
+    """Sunday: the detailed week grid — every person, every day, hours + status."""
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    if not ch: return
+    n = now_pt().date()
+    monday = n - dt.timedelta(days=n.weekday())          # this week's Monday (runs on Sunday)
+    days = [monday + dt.timedelta(days=i) for i in range(6)]   # Mon..Sat
+    hist = load_json(HISTORY_FILE, {})
+    people_map = {}
+    for i, day in enumerate(days):
+        snap = hist.get(day.isoformat()) or {}
+        for mid, r in snap.items():
+            p = people_map.setdefault(mid, {"name": r["name"],
+                "cells": [{"status": "none", "hours": 0.0} for _ in days],
+                "tot_h": 0.0, "tot_out": 0.0, "cam_h": 0.0, "l": 0, "e": 0, "ns": 0})
+            p["name"] = r["name"]
+            hrs = r.get("seconds", 0) / 3600.0
+            away = r.get("away_seconds", 0) / 3600.0
+            if r.get("no_show"): status = "noshow"; p["ns"] += 1
+            elif r.get("late") and r.get("left_early"): status = "late+early"; p["l"] += 1; p["e"] += 1
+            elif r.get("late"): status = "late"; p["l"] += 1
+            elif r.get("left_early"): status = "early"; p["e"] += 1
+            elif away >= AWAY_FLAG_DAILY_MINS / 60.0: status = "gaps"   # away is in hours here
+            else: status = "ontime"
+            p["cells"][i] = {"status": status, "hours": hrs}
+            p["tot_h"] += hrs; p["cam_h"] += r.get("camera_seconds", 0) / 3600.0
+            if not r.get("no_show"): p["tot_out"] += away
+    if not people_map: return
+    people = []
+    for p in people_map.values():
+        p["cam"] = (p["cam_h"] / p["tot_h"]) if p["tot_h"] else 0.0
+        people.append(p)
+    people.sort(key=lambda p: (p["l"] + p["e"] + p["ns"], p["tot_out"]), reverse=True)  # problems on top
+    label = f"{days[0].strftime('%b %-d')} – {days[-1].strftime('%b %-d, %Y')} · Mon–Sat"
+    buf = render_week_matrix(label, days, people)
+    e = discord.Embed(title=f"🗓️ Weekly Attendance Detail — week of {days[0].strftime('%b %-d')}",
+        description=f"**{len(people)}** tracked · problems sorted to the top",
+        color=0x3498DB)
+    e.set_footer(text="Owner + trainers · full per-day breakdown")
+    try:
+        if buf:
+            f = discord.File(buf, filename="week.png")
+            e.set_image(url="attachment://week.png")
+            await ch.send(embed=e, file=f)
+        else:
+            await ch.send(embed=e)
+    except Exception as ex: print("week matrix", ex)
 
 
 # ---- rank roles ------------------------------------------------------------
@@ -1897,6 +2046,7 @@ async def scheduler():
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
         _last_weekly = n.date()
         await post_sunday_wrap()       # ONE public wrap + private accountability + roles
+        await post_weekly_attendance() # detailed per-day week grid (owner + trainers)
         await post_lead_roi()          # weekly lead-spend ROI scoreboard (public)
         await post_lead_report()       # lead-buying breakdown (owner-only)
         await refresh_team_ap_board()  # keep the live manager board fresh
