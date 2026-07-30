@@ -78,7 +78,8 @@ WEEKLY_TIME = dt.time(18, 0)
 WEEKLY_DAY  = 6                 # Sunday — the 6 PM PT "Sunday Wrap"
 MONTHLY_TIME = dt.time(10, 0)   # 1st-of-month reports post at 10 AM PT
 
-ARRIVAL_PINGS = False   # real-time clock-in lines in #attendance-log (data still tracked)
+ARRIVAL_PINGS = False   # real-time ON-TIME clock-in lines (off — keeps the log clean)
+LATE_PINGS    = True    # real-time LATE arrival notes, as they join (owner + trainers)
 
 # "Out of rooms" tracking: time NOT in a voice room during the scheduled window
 # (e.g. 9 AM – 6 PM). Lunch, errands, ghosting — it all counts. Used to spot reps who
@@ -447,15 +448,21 @@ def sync_current_voice():
         save_state(); print(f"voice rescan: picked up {found} member(s) already in rooms")
 
 async def announce_arrival(member, ts, late, start):
-    """Real-time clock-in lines are OFF (ARRIVAL_PINGS) — arrivals are still tracked and
-       land in the daily report + Accountability Board; the log channel stays clean."""
+    """LATE arrivals post to #attendance-log in real time (LATE_PINGS); on-time joins
+       stay silent (ARRIVAL_PINGS off) so the log only speaks when something's wrong."""
+    if late and LATE_PINGS:
+        ch = client.get_channel(LOG_CHANNEL_ID)
+        if not ch: return
+        mins = int((ts - ts.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)).total_seconds() // 60)
+        try:
+            await ch.send(f"🔴 **LATE** — **{member.display_name}** joined at **{fmt(ts)}** "
+                          f"({mins} min after the {start.strftime('%-I:%M %p')} start).")
+        except Exception as e: print("announce", e)
+        return
     if not ARRIVAL_PINGS: return
     ch = client.get_channel(LOG_CHANNEL_ID)
     if not ch: return
-    msg = (f"🔴 **LATE** — {member.mention} clocked in at **{fmt(ts)}** "
-           f"(start was {start.strftime('%-I:%M %p')})." if late
-           else f"🟢 {member.mention} clocked in at **{fmt(ts)}** — on time.")
-    try: await ch.send(msg)
+    try: await ch.send(f"🟢 {member.display_name} clocked in at **{fmt(ts)}** — on time.")
     except Exception as e: print("announce", e)
 
 
