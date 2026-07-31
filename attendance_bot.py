@@ -419,6 +419,26 @@ async def on_voice_state_update(member, before, after):
             rec["camera_seconds"] = live_camera(rec); rec["camera_on"] = False
             rec["cam_ts"] = None; save_state()
 
+def recheck_lates():
+    """Re-evaluate today's late flags against the CURRENT schedule. Heals stale flags
+       after a schedule change (late is stamped at join time, so a config fix alone
+       doesn't clear flags already given out earlier in the day)."""
+    start = scheduled_start_today()
+    if start is None: return
+    changed = False
+    for rec in today.values():
+        fj = rec.get("first_join")
+        if not fj: continue
+        try:
+            joined = dt.datetime.fromisoformat(fj).astimezone(PACIFIC).time()
+        except Exception:
+            continue
+        should = joined > start
+        if bool(rec.get("late")) != should:
+            rec["late"] = should; changed = True
+    if changed:
+        save_state(); print("recheck_lates: corrected stale late flags")
+
 def sync_current_voice():
     """On boot: pick up everyone ALREADY sitting in a work room, so a redeploy in the
        middle of a call session never loses live tracking. Anyone the bot thought had
@@ -555,6 +575,7 @@ def render_daily_card(day_label, start_label, end_label, rows):
 def build_daily_rows():
     """Today's per-person rows — GRINDERS ON TOP (most hours in rooms first),
        lightest attendance and no-shows at the bottom."""
+    recheck_lates()                                  # always judge against the current schedule
     guild = client.get_guild(GUILD_ID)
     rows = []
     for mid, rec in today.items():
@@ -2206,6 +2227,8 @@ async def on_ready():
     load_state()
     try: sync_current_voice()                      # pick up anyone already mid-session
     except Exception as e: print("voice rescan", e)
+    try: recheck_lates()                           # heal stale late flags after schedule changes
+    except Exception as e: print("recheck lates", e)
     await ensure_start_message()
     await ensure_bot_avatar()
     try: await tree.sync(guild=discord.Object(GUILD_ID))
