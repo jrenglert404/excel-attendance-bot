@@ -77,6 +77,8 @@ END_BY_DAY  = {0: dt.time(18, 0), 1: dt.time(18, 0), 2: dt.time(18, 0),
                3: dt.time(18, 0), 4: dt.time(18, 0), 5: dt.time(14, 0)}  # Sat ends 2 PM
 WEEKLY_TIME = dt.time(18, 0)
 DEALS_DAILY_TIME = dt.time(21, 0)   # daily deals total posts at 9 PM PT (after late closes)
+WEEK_MATRIX_DAY  = 5                 # Saturday…
+WEEK_MATRIX_TIME = dt.time(15, 0)    # …3 PM PT — full Mon–Sat week is in the books by then
 WEEKLY_DAY  = 6                 # Sunday — the 6 PM PT "Sunday Wrap"
 MONTHLY_TIME = dt.time(10, 0)   # 1st-of-month reports post at 10 AM PT
 
@@ -913,6 +915,10 @@ async def send_report_cards():
     state = await fetch_app_state() if SUPABASE_KEY else None
     guild = client.get_guild(GUILD_ID)
     week_possible = scheduled_week_hours()             # e.g. 50.5h (builder call not included)
+    lead_totals = {}
+    if SUPABASE_KEY:
+        try: lead_totals = _agent_lead_totals(await fetch_lead_purchases(_live_month_key()))
+        except Exception as ex: print("cards leads", ex)
     sent = 0
     for a in cur.values():
         nm = a["name"]
@@ -926,17 +932,26 @@ async def send_report_cards():
         h_arrow = _trend_arrow(a["hours"], prev_a.get("hours", 0))
         ap_arrow = _trend_arrow(my_cur_ap, my_prev_ap)
         campct = (a["cam"] / a["hours"] * 100) if a["hours"] else 0
+        hours_pct = (a["hours"] / week_possible * 100) if week_possible else 0
         e = discord.Embed(title="📇 Your Week — Excel Financial",
             description=now_pt().strftime("Week ending %A, %b %-d · private to you"), color=0xF1C40F)
-        e.add_field(name="⏱️ Floor time",
-            value=(f"**{a['hours']:.1f}h of {week_possible:g}h** on the floor {h_arrow} "
-                   f"(last wk {prev_a.get('hours', 0):.1f}h)\n"
-                   f"out {a.get('away', 0):.1f}h · camera {campct:.0f}%"), inline=False)
+        e.add_field(name="⏱️ Hours worked",
+            value=(f"**{a['hours']:.1f}h of {week_possible:g}h scheduled — {hours_pct:.0f}%** {h_arrow} "
+                   f"(last wk {prev_a.get('hours', 0):.1f}h)"), inline=False)
+        e.add_field(name="📷 Camera on",
+            value=f"**{campct:.0f}%** of your floor time", inline=False)
         e.add_field(name="🕘 Attendance",
             value=f"{a['late']} late · {a['early']} early leave · {a['noshow']} no-show", inline=False)
         e.add_field(name="💰 Production",
             value=(f"**{my_deals} deals · ${my_cur_ap:,.2f} AP** {ap_arrow} "
                    f"(last wk ${my_prev_ap:,.2f})"), inline=False)
+        lt = lead_totals.get(canon) or lead_totals.get(nm)
+        if lt and lt.get("spend", 0) > 0:
+            e.add_field(name="💸 Lead spend (month)",
+                value=f"**${lt['spend']:,.2f}** · {lt['leads']} leads · {lt['orders']} orders", inline=False)
+        else:
+            e.add_field(name="💸 Lead spend (month)",
+                value="No lead orders logged — the button is in <#" + str(LEAD_ROI_CH_ID) + ">", inline=False)
         e.set_footer(text="Resets Monday. The board doesn't lie — go move your dot. 🦁")
         try:
             await member.send(embed=e); sent += 1
@@ -2504,6 +2519,7 @@ _last_team_ip = None
 _last_monthly = None
 _last_builder = None
 _last_deals_daily = None
+_last_week_matrix = None
 
 @client.event
 async def on_ready():
@@ -2543,6 +2559,10 @@ async def scheduler():
     global _last_builder
     if n.weekday() == BUILDER_DAY and n.time() >= BUILDER_CHECK and _last_builder != n.date():
         _last_builder = n.date(); await post_builder_roll()
+    # Saturday 3 PM PT — the weekly attendance grid (full Mon–Sat week is complete)
+    global _last_week_matrix
+    if n.weekday() == WEEK_MATRIX_DAY and n.time() >= WEEK_MATRIX_TIME and _last_week_matrix != n.date():
+        _last_week_matrix = n.date(); await post_weekly_attendance()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await post_daily_report()
         await refresh_accountability_board()   # owner's bird's-eye board follows the daily close
@@ -2556,7 +2576,6 @@ async def scheduler():
         _last_weekly = n.date()
         await post_sunday_wrap()       # ONE public wrap + private accountability + roles
         await send_report_cards()      # every rep's private DM report card
-        await post_weekly_attendance() # detailed per-day week grid (owner + trainers)
         await post_quadrant()          # hours-vs-production quadrant (owner + trainers)
         await post_lead_roi()          # weekly lead-spend ROI scoreboard (public)
         await post_lead_report()       # lead-buying breakdown (owner-only)
