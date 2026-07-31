@@ -655,6 +655,57 @@ async def post_autoflags(ch, guild):
 
 
 # ---- weekly ---------------------------------------------------------------
+def aggregate_dates(dates):
+    """Aggregate attendance over an explicit list of dates (no live merge)."""
+    hist = load_json(HISTORY_FILE, {}); agg = {}
+    for day in dates:
+        iso = day.isoformat(); snap = hist.get(iso)
+        if not snap: continue
+        scheduled = SCHEDULE.get(day.weekday()) is not None
+        for mid, r in snap.items():
+            a = agg.setdefault(mid, {"name": r["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
+                "present": 0, "late": 0, "early": 0, "noshow": 0, "away": 0.0})
+            a["name"] = r["name"]; a["hours"] += r.get("seconds", 0)/3600.0
+            a["cam"] += r.get("camera_seconds", 0)/3600.0
+            if not r.get("no_show"): a["away"] += r.get("away_seconds", 0)/3600.0
+            if scheduled:
+                a["scheduled"] += 1
+                if r.get("no_show"): a["noshow"] += 1
+                else:
+                    a["present"] += 1
+                    if r.get("late"): a["late"] += 1
+                    if r.get("left_early"): a["early"] += 1
+    return agg
+
+def _week_dates(offset_weeks=0):
+    """Mon..Sat of the current week (offset_weeks back)."""
+    n = now_pt().date()
+    monday = n - dt.timedelta(days=n.weekday()) - dt.timedelta(weeks=offset_weeks)
+    return [monday + dt.timedelta(days=i) for i in range(6)]
+
+def _trend_arrow(cur, prev, tol=0.1):
+    if prev <= 0 and cur <= 0: return "–"
+    if cur > prev * (1 + tol): return "▲"
+    if cur < prev * (1 - tol): return "▼"
+    return "–"
+
+def _merge_live_today(agg, hist):
+    """Fold TODAY'S live clocks into an aggregate — mid-day stats were blind to the
+       current session until the 6 PM snapshot, which made /mystats read 'no floor time'."""
+    if today_key() in hist: return agg                    # already snapshotted — don't double-count
+    scheduled = scheduled_start_today() is not None
+    for mid, rec in today.items():
+        a = agg.setdefault(mid, {"name": rec["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
+            "present": 0, "late": 0, "early": 0, "noshow": 0, "away": 0.0})
+        a["name"] = rec["name"]
+        a["hours"] += live_seconds(rec) / 3600.0
+        a["cam"] += live_camera(rec) / 3600.0
+        a["away"] += away_today(rec) / 3600.0
+        if scheduled:
+            a["scheduled"] += 1; a["present"] += 1
+            if rec.get("late"): a["late"] += 1            # early-leave judged at day's end, not mid-day
+    return agg
+
 def aggregate_week():
     hist = load_json(HISTORY_FILE, {}); end = now_pt().date(); agg = {}
     for i in range(7):
@@ -674,7 +725,7 @@ def aggregate_week():
                     a["present"] += 1
                     if r.get("late"): a["late"] += 1
                     if r.get("left_early"): a["early"] += 1
-    return agg
+    return _merge_live_today(agg, hist)
 
 def aggregate_month():
     """Month-to-date attendance per member (same shape as aggregate_week)."""
@@ -696,7 +747,7 @@ def aggregate_month():
                     a["present"] += 1
                     if r.get("late"): a["late"] += 1
                     if r.get("left_early"): a["early"] += 1
-    return agg
+    return _merge_live_today(agg, hist)
 
 def bar(pct, width=14):
     pct = max(0.0, min(1.0, pct))
@@ -808,9 +859,86 @@ async def post_sunday_wrap():
             value="\n".join(f"• {r['name']} — {(r['cam']/r['hours'])*100:.0f}% of {r['hours']:.1f}h" for r in lowcam) or "None 🎉", inline=False)
         e.add_field(name="⚠️ At-risk (consistency < 60%)",
             value="\n".join(f"• {r['name']} — {consist(r)*100:.0f}% ({r['present']}/{r['scheduled']} days, {r['noshow']} NS)" for r in at_risk) or "None 🎉", inline=False)
+        # 💸 cost of empty seats — absence priced at this week's floor rate
+        try:
+            floor_hours = sum(r["hours"] for r in rows)
+            ns_days = sum(r["noshow"] for r in rows)
+            out_hours = sum(r.get("away", 0) for r in rows)
+            if floor_hours > 1 and ds["ap"] > 0:
+                rate = ds["ap"] / floor_hours
+                lost_h = ns_days * 8.5 + out_hours
+                e.add_field(name="💸 Cost of empty seats (est.)",
+                    value=(f"Floor produced **${rate:,.0f}/hour** this week. "
+                           f"**{ns_days}** no-show days + **{out_hours:.0f}h** out of rooms ≈ "
+                           f"**${rate * lost_h:,.0f} in AP left on the table.**"), inline=False)
+        except Exception as ex:
+            print("empty seats", ex)
         e.set_footer(text="Owner eyes only · Pacific")
         try: await priv.send(embed=e)
         except Exception as ex: print("weekly priv", ex)
+
+
+# ---- Sunday DM report cards ------------------------------------------------
+REPORT_CARDS = True     # every rep gets THEIR OWN stats DM'd privately at the Sunday wrap
+
+async def send_report_cards():
+    """Private per-rep report card DMs — nobody sees anyone else's. Zero channel noise."""
+    if not REPORT_CARDS: return
+    cur = aggregate_dates(_week_dates(0))
+    prev = aggregate_dates(_week_dates(1))
+    prev_by_name = {a["name"].strip().lower(): a for a in prev.values()}
+    # deals: this week + last week, split client-side
+    wk_start = _week_dates(0)[0]; prev_start = _week_dates(1)[0]
+    cur_ds, prev_ds = {"by": {}}, {"by": {}}
+    if SUPABASE_KEY:
+        try:
+            since = dt.datetime.combine(prev_start, dt.time(0, 0), tzinfo=PACIFIC).astimezone(dt.timezone.utc).isoformat()
+            allde = await fetch_deals_since(since)
+            cut = dt.datetime.combine(wk_start, dt.time(0, 0), tzinfo=PACIFIC).astimezone(dt.timezone.utc).isoformat()
+            cur_ds = summarize_deals([d for d in allde if (d.get("posted_at") or "") >= cut])
+            prev_ds = summarize_deals([d for d in allde if (d.get("posted_at") or "") < cut])
+        except Exception as ex: print("cards deals", ex)
+    state = await fetch_app_state() if SUPABASE_KEY else None
+    scores = compute_excel_scores(state)
+    ranked = sorted(((n2, r2["pts"]) for n2, r2 in scores.items()
+                     if str(n2).lower() not in IP_EXCLUDE), key=lambda kv: kv[1], reverse=True)
+    rank_of = {n2.strip().lower(): i + 1 for i, (n2, _) in enumerate(ranked)}
+    guild = client.get_guild(GUILD_ID)
+    sent = 0
+    for a in cur.values():
+        nm = a["name"]
+        if guild and rank_of and nm.strip().lower() not in rank_of and a["hours"] <= 0: continue
+        member = find_member(nm)
+        if not member or member.bot or (guild and member.id == guild.owner_id): continue
+        canon = (match_roster(state, nm) if state else None) or nm
+        my_cur_ap = cur_ds["by"].get(canon, {}).get("ap", 0.0)
+        my_prev_ap = prev_ds["by"].get(canon, {}).get("ap", 0.0)
+        my_deals = cur_ds["by"].get(canon, {}).get("deals", 0)
+        prev_a = prev_by_name.get(nm.strip().lower(), {})
+        h_arrow = _trend_arrow(a["hours"], prev_a.get("hours", 0))
+        ap_arrow = _trend_arrow(my_cur_ap, my_prev_ap)
+        campct = (a["cam"] / a["hours"] * 100) if a["hours"] else 0
+        sc = scores.get(nm) or scores.get(canon)
+        rk = rank_of.get(nm.strip().lower()) or rank_of.get(str(canon).strip().lower())
+        e = discord.Embed(title="📇 Your Week — Excel Financial",
+            description=now_pt().strftime("Week ending %A, %b %-d · private to you"), color=0xF1C40F)
+        e.add_field(name="⏱️ Floor time",
+            value=(f"**{a['hours']:.1f}h in rooms** {h_arrow} (last wk {prev_a.get('hours', 0):.1f}h)\n"
+                   f"out {a.get('away', 0):.1f}h · camera {campct:.0f}%"), inline=False)
+        e.add_field(name="🕘 Attendance",
+            value=f"{a['late']} late · {a['early']} early leave · {a['noshow']} no-show", inline=False)
+        e.add_field(name="💰 Production",
+            value=(f"**{my_deals} deals · ${my_cur_ap:,.2f} AP** {ap_arrow} "
+                   f"(last wk ${my_prev_ap:,.2f})"), inline=False)
+        if sc and rk:
+            e.add_field(name="🏅 Excel Score",
+                value=f"**{sc['pts']} pts** · #{rk} of {len(ranked)} this month", inline=False)
+        e.set_footer(text="Resets Monday. The board doesn't lie — go move your dot. 🦁")
+        try:
+            await member.send(embed=e); sent += 1
+        except Exception:
+            pass                                        # DMs closed — skip silently
+    print(f"report cards sent: {sent}")
 
 
 # ---- verification ---------------------------------------------------------
@@ -1662,12 +1790,17 @@ async def refresh_accountability_board():
     if not rows: return
     order = sorted(rows.items(), key=lambda kv: (kv[1]["late"] + kv[1]["early"] + kv[1]["noshow"],
                                                  kv[1].get("away", 0), -kv[1]["ap"]), reverse=True)
-    head = f"{'Rep':<13}{'L':>3}{'E':>3}{'NS':>3}{'Hrs':>6}{'Out':>6}{'Cam':>5}{'AP':>12}{'Sc':>4}"
+    # trend: this week's hours vs last week's, per rep (▲ up ▼ down – flat)
+    cur_w = {a["name"].strip().lower(): a["hours"] for a in aggregate_dates(_week_dates(0)).values()}
+    prev_w = {a["name"].strip().lower(): a["hours"] for a in aggregate_dates(_week_dates(1)).values()}
+    head = f"{'Rep':<13}{'L':>3}{'E':>3}{'NS':>3}{'Hrs':>6}{'T':>2}{'Out':>6}{'Cam':>5}{'AP':>12}{'Sc':>4}"
     L = [head, "─" * len(head)]
     for nm, r in order[:25]:
         campct = (r["cam"] / r["hours"] * 100) if r["hours"] else 0
+        low = nm.strip().lower()
+        tr = _trend_arrow(cur_w.get(low, 0), prev_w.get(low, 0))
         L.append(f"{nm[:12]:<13}{r['late']:>3}{r['early']:>3}{r['noshow']:>3}"
-                 f"{r['hours']:>6.1f}{r.get('away', 0):>6.1f}{campct:>4.0f}%"
+                 f"{r['hours']:>6.1f}{tr:>2}{r.get('away', 0):>6.1f}{campct:>4.0f}%"
                  f"{'$'+format(r['ap'], ',.2f'):>12}{r['pts']:>4}")
     e = discord.Embed(title=f"📋 Accountability Board — {_month_label(_live_month_key())}",
         description=("Worst attendance first · results on the same line\n```\n" + "\n".join(L) + "\n```"),
@@ -1846,10 +1979,8 @@ async def ensure_commands_message():
         description=(
             "Type `/` in any channel and pick a command. **Answers are private — only you see them.**\n\n"
             "**/mystats** — your week: hours, camera %, lates · your month: deals, AP, lead spend & ROI\n"
-            "**/leaderboard** — this month's top 10 by personal AP + the team total\n"
-            "**/team** — this month's top managers by team AP (full downlines)\n"
-            "**/pace** — where the month is tracking vs. where it'll land\n"
-            "**/attendance** — *(owner & trainers only)* today / week / month attendance views\n\n"
+            "**/attendance** — *(owner & trainers only)* today / week / month / hours-vs-production views\n\n"
+            "Leaderboards live in <#" + str(TEAM_CH_ID) + "> — updated live, all month.\n"
             "**Logging lead orders** → hit the button in <#" + str(LEAD_ROI_CH_ID) + "> every time you buy.\n"
             "*Tip: keep your server nickname set to your real name so the bot can match your production.*"),
         color=0x5865F2)
@@ -1910,64 +2041,6 @@ async def cmd_mystats(interaction: discord.Interaction):
             print("mystats score", ex)
     e = discord.Embed(title=f"📊 {name}", description="\n".join(lines), color=0x1ABC9C)
     await interaction.followup.send(embed=e, ephemeral=True)
-
-@tree.command(name="leaderboard", description="This month's top 10 by personal AP (private view)", guild=discord.Object(GUILD_ID))
-async def cmd_leaderboard(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if not SUPABASE_KEY: return await interaction.followup.send("Data source offline.", ephemeral=True)
-    state = await fetch_app_state()
-    if not state: return await interaction.followup.send("Couldn't reach the tracker.", ephemeral=True)
-    mkey = _live_month_key(); prod = _submitted_ap_by_agent(state, mkey)
-    apps = _apps_by_agent(state, mkey)
-    rows = sorted(((a, v) for a, v in prod.items() if v > 0), key=lambda r: r[1], reverse=True)[:10]
-    medals = ["🥇", "🥈", "🥉"]
-    body = "\n".join(f"{medals[i] if i < 3 else f'**{i+1}.**'} {a} — **${v:,.2f}**"
-                     + (f" · {apps[a]} apps" if apps.get(a) else "")
-                     for i, (a, v) in enumerate(rows)) or "No production yet."
-    total = sum(prod.values())
-    e = discord.Embed(title=f"🏆 Producer Scoreboard — {_month_label(mkey)}",
-        description=body + f"\n\n🏛️ Team total: **${total:,.2f}**", color=0xF1C40F)
-    await interaction.followup.send(embed=e, ephemeral=True)
-
-@tree.command(name="team", description="This month's top managers by team AP (private view)", guild=discord.Object(GUILD_ID))
-async def cmd_team(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if not SUPABASE_KEY: return await interaction.followup.send("Data source offline.", ephemeral=True)
-    state = await fetch_app_state()
-    if not state: return await interaction.followup.send("Couldn't reach the tracker.", ephemeral=True)
-    mkey = _live_month_key(); prod = _submitted_ap_by_agent(state, mkey)
-    team = _team_rollup(state, prod)
-    rows = [(mgr, team.get(mgr, 0)) for mgr in _managers(state)
-            if str(mgr).lower() not in IP_EXCLUDE
-            and (team.get(mgr, 0) - float(prod.get(mgr, 0) or 0)) > 0]
-    rows.sort(key=lambda r: r[1], reverse=True)
-    medals = ["🥇", "🥈", "🥉"]
-    body = "\n".join(f"{medals[i] if i < 3 else f'**{i+1}.**'} {a} — **${v:,.2f}**"
-                     for i, (a, v) in enumerate(rows[:10])) or "No team production yet."
-    e = discord.Embed(title=f"👔 Manager Scoreboard — {_month_label(mkey)}", description=body, color=0x9B59B6)
-    await interaction.followup.send(embed=e, ephemeral=True)
-
-@tree.command(name="pace", description="Where the month is tracking (private view)", guild=discord.Object(GUILD_ID))
-async def cmd_pace(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if not SUPABASE_KEY: return await interaction.followup.send("Data source offline.", ephemeral=True)
-    state = await fetch_app_state()
-    if not state: return await interaction.followup.send("Couldn't reach the tracker.", ephemeral=True)
-    n = now_pt(); mkey = _live_month_key()
-    prod = _submitted_ap_by_agent(state, mkey); total = sum(prod.values())
-    days_in = (dt.date(n.year + (n.month == 12), (n.month % 12) + 1, 1) - dt.date(n.year, n.month, 1)).days
-    proj = total / max(n.day, 1) * days_in
-    wk_start = (n - dt.timedelta(days=n.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    try: wdeals = summarize_deals(await fetch_deals_since(wk_start.astimezone(dt.timezone.utc).isoformat()))
-    except Exception: wdeals = {"apps": 0}
-    pct = (wdeals["apps"] / WEEKLY_APPS_GOAL) if WEEKLY_APPS_GOAL else 0
-    e = discord.Embed(title=f"📈 Pace — {_month_label(mkey)}",
-        description=(f"**${int(round(total)):,} AP** through day {n.day} of {days_in}\n"
-                     f"Projected month end: **${int(round(proj)):,}**\n\n"
-                     f"This week: **{wdeals['apps']} / {WEEKLY_APPS_GOAL} apps**\n`{bar(pct)}` {pct*100:.0f}%"),
-        color=0x3498DB)
-    await interaction.followup.send(embed=e, ephemeral=True)
-
 
 # ---- Hours vs Production quadrant (owner + trainers) -----------------------
 QUAD_COLORS = {"core": (46, 204, 113), "coach": (241, 196, 15),
@@ -2103,6 +2176,94 @@ async def post_quadrant():
     try: await ch.send(file=discord.File(buf, filename="quadrant.png"))
     except Exception as ex: print("quadrant", ex)
 
+# ---- guardrails -------------------------------------------------------------
+FLOOR_MIN_PEOPLE   = 5     # empty-floor alarm: fewer than this in rooms 15 min after start
+SENTINEL_STALE_HRS = 48    # sync sentinel: warn if no new deals for this many hours (workdays)
+
+def _people_in_rooms():
+    guild = client.get_guild(GUILD_ID)
+    if not guild: return 0
+    return sum(1 for vc in guild.voice_channels if is_work_channel(vc)
+               for mem in vc.members if not mem.bot)
+
+async def check_floor_alarm():
+    """15 min after start: if the floor is empty-ish, one ping to the owner. Once a day."""
+    n = _people_in_rooms()
+    if n >= FLOOR_MIN_PEOPLE: return
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    guild = client.get_guild(GUILD_ID)
+    if not ch: return
+    owner = f"<@{guild.owner_id}> " if guild and guild.owner_id else ""
+    start = scheduled_start_today()
+    try:
+        await ch.send(f"{owner}🚨 **FLOOR ALARM** — only **{n}** {'person' if n == 1 else 'people'} in rooms "
+                      f"15 minutes after the {start.strftime('%-I:%M %p')} start.")
+    except Exception as ex: print("floor alarm", ex)
+
+async def check_sync_sentinel():
+    """Daily: warn the owner once if the data pipes look broken (stale deals / dead tracker)."""
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    guild = client.get_guild(GUILD_ID)
+    if not ch: return
+    problems = []
+    try:
+        deals = await fetch_recent_deals(1)
+        newest = (deals[0].get("posted_at") if deals else None)
+        if newest:
+            age_h = (dt.datetime.now(dt.timezone.utc)
+                     - dt.datetime.fromisoformat(str(newest).replace("Z", "+00:00"))).total_seconds() / 3600
+            if age_h > SENTINEL_STALE_HRS:
+                problems.append(f"no new deals in **{age_h:.0f}h** — tracker→Discord deal sync may be broken")
+        elif not deals:
+            problems.append("deals table returned nothing")
+    except Exception:
+        problems.append("can't reach the deals table")
+    try:
+        if not await fetch_app_state():
+            problems.append("can't read the tracker's app_state (roster/hierarchy/IP source)")
+    except Exception:
+        problems.append("app_state fetch is erroring")
+    if not problems: return
+    owner = f"<@{guild.owner_id}> " if guild and guild.owner_id else ""
+    e = discord.Embed(title="🩺 Sync Sentinel — data pipe warning",
+        description="\n".join("• " + p for p in problems), color=0xC0392B)
+    e.set_footer(text="Checked daily at the 6 PM report · fix = check Supabase keys / tracker sync")
+    try: await ch.send(content=owner.strip() or None, embed=e)
+    except Exception as ex: print("sentinel", ex)
+
+@tree.command(name="export", description="Owner: download this month's attendance + deals as CSV",
+              guild=discord.Object(GUILD_ID))
+async def cmd_export(interaction: discord.Interaction):
+    guild = client.get_guild(GUILD_ID)
+    if not guild or interaction.user.id != guild.owner_id:
+        return await interaction.response.send_message("⛔ Owner only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    files = []
+    # attendance CSV — every snapshotted day this month
+    hist = load_json(HISTORY_FILE, {})
+    mpref = _live_month_key()
+    lines = ["date,name,hours_in,hours_out,camera_hours,late,left_early,no_show"]
+    for day in sorted(k for k in hist if k.startswith(mpref)):
+        for r in hist[day].values():
+            nm = str(r.get('name', '')).replace(',', ' ')
+            lines.append(f"{day},{nm},{r.get('seconds', 0)/3600:.2f},{r.get('away_seconds', 0)/3600:.2f},"
+                         f"{r.get('camera_seconds', 0)/3600:.2f},{int(bool(r.get('late')))},"
+                         f"{int(bool(r.get('left_early')))},{int(bool(r.get('no_show')))}")
+    files.append(discord.File(io.BytesIO("\n".join(lines).encode()), filename=f"attendance_{mpref}.csv"))
+    # deals CSV — this month
+    if SUPABASE_KEY:
+        try:
+            mstart = now_pt().replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc).isoformat()
+            deals = await fetch_deals_since(mstart)
+            dl = ["posted_at,agent,apps,ap,carrier"]
+            for de in deals:
+                dl.append(f"{de.get('posted_at','')},{str(de.get('agent','')).replace(',',' ')},"
+                          f"{de.get('apps','')},{de.get('ap','')},{str(de.get('carrier','')).replace(',',' ')}")
+            files.append(discord.File(io.BytesIO("\n".join(dl).encode()), filename=f"deals_{mpref}.csv"))
+        except Exception as ex: print("export deals", ex)
+    await interaction.followup.send(f"📦 {_month_label(mpref)} — your data:", files=files, ephemeral=True)
+
 def _can_view_attendance(user):
     guild = client.get_guild(GUILD_ID)
     if not guild: return False
@@ -2203,6 +2364,89 @@ async def post_trend_chart():
     try: await ch.send(file=discord.File(buf, filename="trend.png"))
     except Exception as ex: print("trend", ex)
 
+def render_deal_clock(byday, byhour, label):
+    """Two bar panels: AP by day of week, and deals by hour of day (PT)."""
+    if not HAVE_PIL: return None
+    W, H = 1100, 560
+    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
+    d.text((40, 30), "DEAL CLOCK", font=_card_font(34, True), fill=CARD_GOLD)
+    d.text((40, 76), f"{label} · when the money actually happens (Pacific)", font=_card_font(19), fill=CARD_DIM)
+    def panel(x0, x1, title, keys, vals, fmtv):
+        top, bot = 150, H - 90
+        d.text((x0, top - 28), title, font=_card_font(18, True), fill=CARD_WHITE)
+        peak = max(vals + [1])
+        slot = (x1 - x0) / max(len(keys), 1)
+        for i, k in enumerate(keys):
+            bh = int((bot - top) * (vals[i] / peak))
+            bx = x0 + slot * i + slot * 0.18
+            col = CARD_GOLD if vals[i] == peak and peak > 0 else _blend(CARD_GOLD, 0.5)
+            d.rectangle([bx, bot - bh, bx + slot * 0.64, bot], fill=col)
+            f = _card_font(15); lw = d.textlength(str(k), font=f)
+            d.text((x0 + slot * i + (slot - lw) / 2, bot + 8), str(k), font=f, fill=CARD_DIM)
+            if vals[i] == peak and peak > 0:
+                vtxt = fmtv(vals[i]); vw = d.textlength(vtxt, font=f)
+                d.text((x0 + slot * i + (slot - vw) / 2, max(top + 4, bot - bh - 22)),
+                       vtxt, font=f, fill=CARD_BLACK if bh > (bot - top) - 26 else CARD_WHITE)
+    panel(50, 470, "AP BY DAY", ["MON","TUE","WED","THU","FRI","SAT"],
+          [byday.get(i, 0.0) for i in range(6)], lambda v: f"${v/1000:.0f}k")
+    hours = list(range(8, 20))
+    panel(520, W - 50, "DEALS BY HOUR", [str(h % 12 or 12) for h in hours],
+          [byhour.get(h, 0) for h in hours], lambda v: str(int(v)))
+    d.text((40, H - 44), "gold = peak · EXCEL FINANCIAL · owner + trainers", font=_card_font(15), fill=CARD_DIM)
+    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
+    return buf
+
+async def post_deal_clock():
+    """Monthly: which days and hours produce — trailing 30 days of deals."""
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    if not ch: return
+    since = (now_pt() - dt.timedelta(days=30)).astimezone(dt.timezone.utc).isoformat()
+    try: deals = await fetch_deals_since(since)
+    except Exception as ex: print("deal clock", ex); return
+    if not deals: return
+    byday, byhour = {}, {}
+    for de in deals:
+        ts = de.get("posted_at")
+        if not ts: continue
+        try: t = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(PACIFIC)
+        except Exception: continue
+        if t.weekday() < 6: byday[t.weekday()] = byday.get(t.weekday(), 0.0) + _num(de.get("ap"))
+        byhour[t.hour] = byhour.get(t.hour, 0) + 1
+    buf = render_deal_clock(byday, byhour, "trailing 30 days")
+    if not buf: return
+    try: await ch.send(file=discord.File(buf, filename="dealclock.png"))
+    except Exception as ex: print("deal clock send", ex)
+
+async def post_persistency_watch():
+    """Monthly, owner-only: suspected fall-offs the tracker's diff engine caught —
+       policies that vanished or shrank between Gateway imports, grouped by rep."""
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(LEAD_REPORT_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state: return
+    cutoff_ms = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=40)).timestamp() * 1000
+    recent = [f for f in (state.get("fallOffs") or []) if _num(f.get("ts")) >= cutoff_ms]
+    if not recent: return
+    by = {}
+    for f in recent:
+        a = str(f.get("a") or "—")
+        e2 = by.setdefault(a, {"n": 0, "ap": 0.0})
+        e2["n"] += 1; e2["ap"] += _num(f.get("ap"))
+    rows = sorted(by.items(), key=lambda kv: kv[1]["ap"], reverse=True)[:15]
+    total = sum(v["ap"] for _, v in rows)
+    e = discord.Embed(title="📉 Persistency Watch — suspected fall-offs (40 days)",
+        description=(f"Policies that **vanished or shrank** between Gateway imports · "
+                     f"**${total:,.0f} AP at risk**\n\n"
+                     + "\n".join(f"• **{a}** — {v['n']} polic{'ies' if v['n'] != 1 else 'y'} · ${v['ap']:,.0f}"
+                                 for a, v in rows)),
+        color=0xC0392B)
+    e.set_footer(text="Owner eyes only · from the tracker's diff engine · chargeback defense")
+    try: await ch.send(embed=e)
+    except Exception as ex: print("persistency", ex)
+
 async def post_ntg_report():
     """Owner-only: whose business actually issues. NTG = issued IP / submitted AP,
        for the most recent complete month that has Gateway data."""
@@ -2243,6 +2487,7 @@ _last_daily = None
 _last_weekly = None
 _last_team_ip = None
 _last_monthly = None
+_last_floor_alarm = None
 
 @client.event
 async def on_ready():
@@ -2277,13 +2522,23 @@ async def scheduler():
     if SUPABASE_KEY and n.day == 1 and n.time() >= MONTHLY_TIME and _last_monthly != (n.year, n.month):
         _last_monthly = (n.year, n.month)
         await post_team_ip_monthly(); await post_trend_chart(); await post_ntg_report()
+        await post_deal_clock(); await post_persistency_watch()
+    # empty-floor alarm — 15 min after start, once per day
+    global _last_floor_alarm
+    start_t = scheduled_start_today()
+    if start_t is not None and _last_floor_alarm != n.date():
+        check_at = (dt.datetime.combine(n.date(), start_t) + dt.timedelta(minutes=15)).time()
+        if n.time() >= check_at:
+            _last_floor_alarm = n.date(); await check_floor_alarm()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
         await refresh_accountability_board()   # owner's bird's-eye board follows the daily close
+        await check_sync_sentinel()            # data-pipe health check, once a day
     # Sunday 6 PM PT — the wrap (recognition + streak/PB recap + rank roles) and weekly boards
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
         _last_weekly = n.date()
         await post_sunday_wrap()       # ONE public wrap + private accountability + roles
+        await send_report_cards()      # every rep's private DM report card
         await post_weekly_attendance() # detailed per-day week grid (owner + trainers)
         await post_quadrant()          # hours-vs-production quadrant (owner + trainers)
         await post_lead_roi()          # weekly lead-spend ROI scoreboard (public)
