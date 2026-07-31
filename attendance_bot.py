@@ -358,6 +358,17 @@ def is_early_leave(rec):
     cutoff = end_today() or dt.time(18, 0)
     return dt.datetime.fromisoformat(ll).astimezone(PACIFIC).time() < cutoff
 
+def scheduled_week_hours():
+    """Total scheduled floor hours per week from SCHEDULE/END_BY_DAY (builder call excluded).
+       Current schedule: Mon 9.5h + Tue–Fri 9h×4 + Sat 5h = 50.5h."""
+    total = 0.0
+    for wd, start in SCHEDULE.items():
+        end = END_BY_DAY.get(wd)
+        if start is None or end is None: continue
+        total += (dt.datetime.combine(dt.date.today(), end)
+                  - dt.datetime.combine(dt.date.today(), start)).total_seconds() / 3600.0
+    return round(total, 1)
+
 def window_span_seconds():
     """Seconds of the scheduled work window (start -> end) elapsed so far today."""
     start = scheduled_start_today(); end = end_today()
@@ -899,15 +910,11 @@ async def send_report_cards():
             prev_ds = summarize_deals([d for d in allde if (d.get("posted_at") or "") < cut])
         except Exception as ex: print("cards deals", ex)
     state = await fetch_app_state() if SUPABASE_KEY else None
-    scores = compute_excel_scores(state)
-    ranked = sorted(((n2, r2["pts"]) for n2, r2 in scores.items()
-                     if str(n2).lower() not in IP_EXCLUDE), key=lambda kv: kv[1], reverse=True)
-    rank_of = {n2.strip().lower(): i + 1 for i, (n2, _) in enumerate(ranked)}
     guild = client.get_guild(GUILD_ID)
+    week_possible = scheduled_week_hours()             # e.g. 50.5h (builder call not included)
     sent = 0
     for a in cur.values():
         nm = a["name"]
-        if guild and rank_of and nm.strip().lower() not in rank_of and a["hours"] <= 0: continue
         member = find_member(nm)
         if not member or member.bot or (guild and member.id == guild.owner_id): continue
         canon = (match_roster(state, nm) if state else None) or nm
@@ -918,21 +925,17 @@ async def send_report_cards():
         h_arrow = _trend_arrow(a["hours"], prev_a.get("hours", 0))
         ap_arrow = _trend_arrow(my_cur_ap, my_prev_ap)
         campct = (a["cam"] / a["hours"] * 100) if a["hours"] else 0
-        sc = scores.get(nm) or scores.get(canon)
-        rk = rank_of.get(nm.strip().lower()) or rank_of.get(str(canon).strip().lower())
         e = discord.Embed(title="📇 Your Week — Excel Financial",
             description=now_pt().strftime("Week ending %A, %b %-d · private to you"), color=0xF1C40F)
         e.add_field(name="⏱️ Floor time",
-            value=(f"**{a['hours']:.1f}h in rooms** {h_arrow} (last wk {prev_a.get('hours', 0):.1f}h)\n"
+            value=(f"**{a['hours']:.1f}h of {week_possible:g}h** on the floor {h_arrow} "
+                   f"(last wk {prev_a.get('hours', 0):.1f}h)\n"
                    f"out {a.get('away', 0):.1f}h · camera {campct:.0f}%"), inline=False)
         e.add_field(name="🕘 Attendance",
             value=f"{a['late']} late · {a['early']} early leave · {a['noshow']} no-show", inline=False)
         e.add_field(name="💰 Production",
             value=(f"**{my_deals} deals · ${my_cur_ap:,.2f} AP** {ap_arrow} "
                    f"(last wk ${my_prev_ap:,.2f})"), inline=False)
-        if sc and rk:
-            e.add_field(name="🏅 Excel Score",
-                value=f"**{sc['pts']} pts** · #{rk} of {len(ranked)} this month", inline=False)
         e.set_footer(text="Resets Monday. The board doesn't lie — go move your dot. 🦁")
         try:
             await member.send(embed=e); sent += 1
@@ -2177,28 +2180,39 @@ async def post_quadrant():
     except Exception as ex: print("quadrant", ex)
 
 # ---- guardrails -------------------------------------------------------------
-FLOOR_MIN_PEOPLE   = 5     # empty-floor alarm: fewer than this in rooms 15 min after start
-SENTINEL_STALE_HRS = 48    # sync sentinel: warn if no new deals for this many hours (workdays)
+# ---- Saturday 2 PM Builder Call roll --------------------------------------
+BUILDER_DAY   = 5                    # Saturday
+BUILDER_CHECK = dt.time(14, 1)       # roll at 2:01 sharp — builders show up on time
+BUILDER_FILE  = "builder_state.json"
 
-def _people_in_rooms():
+async def post_builder_roll():
+    """Who actually showed up for the Saturday 2 PM builder call — owner + trainers."""
     guild = client.get_guild(GUILD_ID)
-    if not guild: return 0
-    return sum(1 for vc in guild.voice_channels if is_work_channel(vc)
-               for mem in vc.members if not mem.bot)
-
-async def check_floor_alarm():
-    """15 min after start: if the floor is empty-ish, one ping to the owner. Once a day."""
-    n = _people_in_rooms()
-    if n >= FLOOR_MIN_PEOPLE: return
     ch = client.get_channel(LOG_CHANNEL_ID)
-    guild = client.get_guild(GUILD_ID)
-    if not ch: return
-    owner = f"<@{guild.owner_id}> " if guild and guild.owner_id else ""
-    start = scheduled_start_today()
-    try:
-        await ch.send(f"{owner}🚨 **FLOOR ALARM** — only **{n}** {'person' if n == 1 else 'people'} in rooms "
-                      f"15 minutes after the {start.strftime('%-I:%M %p')} start.")
-    except Exception as ex: print("floor alarm", ex)
+    if not (guild and ch): return
+    present = sorted({mem.display_name for vc in guild.voice_channels if is_work_channel(vc)
+                      for mem in vc.members if not mem.bot})
+    hist = load_json(BUILDER_FILE, {})
+    hist[today_key()] = present
+    hist = {k: hist[k] for k in sorted(hist)[-12:]}     # keep ~3 months
+    save_json(BUILDER_FILE, hist)
+    # streaks: consecutive builder calls attended
+    dates = sorted(hist)
+    streaks = {}
+    for nm in present:
+        s = 0
+        for dkey in reversed(dates):
+            if nm in hist[dkey]: s += 1
+            else: break
+        streaks[nm] = s
+    body = "\n".join(f"• {nm}" + (f" — {streaks[nm]} in a row" if streaks.get(nm, 0) > 1 else "")
+                     for nm in present) or "Nobody. Empty room."
+    e = discord.Embed(title=f"🔨 Builder Call Roll — {now_pt().strftime('%b %-d')}",
+        description=f"**{len(present)}** showed up at 2 PM:\n{body}",
+        color=0x2ECC71 if present else 0xE23B3B)
+    e.set_footer(text="Owner + trainers · roll taken 2:01 PM sharp · builders show up on time")
+    try: await ch.send(embed=e)
+    except Exception as ex: print("builder roll", ex)
 
 async def check_sync_sentinel():
     """Daily: warn the owner once if the data pipes look broken (stale deals / dead tracker)."""
@@ -2487,7 +2501,7 @@ _last_daily = None
 _last_weekly = None
 _last_team_ip = None
 _last_monthly = None
-_last_floor_alarm = None
+_last_builder = None
 
 @client.event
 async def on_ready():
@@ -2523,13 +2537,10 @@ async def scheduler():
         _last_monthly = (n.year, n.month)
         await post_team_ip_monthly(); await post_trend_chart(); await post_ntg_report()
         await post_deal_clock(); await post_persistency_watch()
-    # empty-floor alarm — 15 min after start, once per day
-    global _last_floor_alarm
-    start_t = scheduled_start_today()
-    if start_t is not None and _last_floor_alarm != n.date():
-        check_at = (dt.datetime.combine(n.date(), start_t) + dt.timedelta(minutes=15)).time()
-        if n.time() >= check_at:
-            _last_floor_alarm = n.date(); await check_floor_alarm()
+    # Saturday 2:10 PM — builder call roll
+    global _last_builder
+    if n.weekday() == BUILDER_DAY and n.time() >= BUILDER_CHECK and _last_builder != n.date():
+        _last_builder = n.date(); await post_builder_roll()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
         await refresh_accountability_board()   # owner's bird's-eye board follows the daily close
