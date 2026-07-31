@@ -76,6 +76,7 @@ SCHEDULE = {0: dt.time(8, 30), 1: dt.time(9, 0), 2: dt.time(9, 0),
 END_BY_DAY  = {0: dt.time(18, 0), 1: dt.time(18, 0), 2: dt.time(18, 0),
                3: dt.time(18, 0), 4: dt.time(18, 0), 5: dt.time(14, 0)}  # Sat ends 2 PM
 WEEKLY_TIME = dt.time(18, 0)
+DEALS_DAILY_TIME = dt.time(21, 0)   # daily deals total posts at 9 PM PT (after late closes)
 WEEKLY_DAY  = 6                 # Sunday — the 6 PM PT "Sunday Wrap"
 MONTHLY_TIME = dt.time(10, 0)   # 1st-of-month reports post at 10 AM PT
 
@@ -2502,6 +2503,7 @@ _last_weekly = None
 _last_team_ip = None
 _last_monthly = None
 _last_builder = None
+_last_deals_daily = None
 
 @client.event
 async def on_ready():
@@ -2542,9 +2544,13 @@ async def scheduler():
     if n.weekday() == BUILDER_DAY and n.time() >= BUILDER_CHECK and _last_builder != n.date():
         _last_builder = n.date(); await post_builder_roll()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
-        _last_daily = n.date(); await post_daily_report(); await post_deals_daily()
+        _last_daily = n.date(); await post_daily_report()
         await refresh_accountability_board()   # owner's bird's-eye board follows the daily close
         await check_sync_sentinel()            # data-pipe health check, once a day
+    # 9 PM PT — daily deals total in #deals (late closes counted)
+    global _last_deals_daily
+    if n.time() >= DEALS_DAILY_TIME and _last_deals_daily != n.date() and scheduled_start_today() is not None:
+        _last_deals_daily = n.date(); await post_deals_daily()
     # Sunday 6 PM PT — the wrap (recognition + streak/PB recap + rank roles) and weekly boards
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
         _last_weekly = n.date()
