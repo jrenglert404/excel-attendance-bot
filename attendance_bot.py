@@ -146,6 +146,7 @@ ROLE_TOP_IP  = 1531874674215227503   # 📈 Top IP
 
 # --- Slash commands live in #commands (instructions auto-posted there) ---
 COMMANDS_CH_ID = 1531874676257591537
+TRAINER_ROLE_ID = 1532072525767508290   # 🎓 Trainer — may view attendance data
 
 # --- Durable state: every state file is mirrored to the Supabase bot_state table so
 #     history (attendance, streaks, quest winners) SURVIVES redeploys. ---
@@ -490,17 +491,19 @@ def trailing_counts(days=7):
     today_iso = end.isoformat()
     for i in range(days):
         for mid, r in hist.get((end - dt.timedelta(days=i)).isoformat(), {}).items():
-            c = counts.setdefault(mid, {"name": r["name"], "late": 0, "early": 0, "away": 0.0})
+            c = counts.setdefault(mid, {"name": r["name"], "late": 0, "early": 0, "away": 0.0, "hours": 0.0})
             c["name"] = r["name"]
             if r.get("late"): c["late"] += 1
             if r.get("left_early"): c["early"] += 1
             if not r.get("no_show"): c["away"] += r.get("away_seconds", 0) / 3600.0
+            c["hours"] += r.get("seconds", 0) / 3600.0
     for mid, rec in today.items():
         if today_iso in hist: break                    # today already snapshotted — don't double-count
-        c = counts.setdefault(mid, {"name": rec["name"], "late": 0, "early": 0, "away": 0.0})
+        c = counts.setdefault(mid, {"name": rec["name"], "late": 0, "early": 0, "away": 0.0, "hours": 0.0})
         if rec["late"]: c["late"] += 1
         if is_early_leave(rec): c["early"] += 1
         c["away"] += away_today(rec) / 3600.0
+        c["hours"] += live_seconds(rec) / 3600.0
     return counts
 
 
@@ -536,7 +539,7 @@ def render_daily_card(day_label, start_label, end_label, rows):
         label = DAILY_STATUS_LABEL.get(r["status"], "")
         if r.get("detail"): label += f"  ·  {r['detail']}"
         d.text((84, y + 30), label, font=_card_font(17), fill=col)
-        right = (f"{r['hours']:.1f}h · out {away_str(r.get('away', 0))} · cam {r['cam']*100:.0f}%"
+        right = (f"{r['hours']:.1f}h in · cam {r['cam']*100:.0f}%"
                  if r["hours"] > 0 else "—")
         vf = _card_font(22); vw = d.textlength(right, font=vf)
         d.text((W - 56 - vw, y + 6), right, font=vf, fill=CARD_WHITE if r["hours"] > 0 else CARD_DIM)
@@ -548,11 +551,10 @@ def render_daily_card(day_label, start_label, end_label, rows):
     buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
     return buf
 
-async def post_daily_report():
-    ch = client.get_channel(LOG_CHANNEL_ID); start = scheduled_start_today()
-    if not ch or start is None: return
+def build_daily_rows():
+    """Today's per-person rows — GRINDERS ON TOP (most hours in rooms first),
+       lightest attendance and no-shows at the bottom."""
     guild = client.get_guild(GUILD_ID)
-    end_t = end_today() or dt.time(18, 0)
     rows = []
     for mid, rec in today.items():
         secs = live_seconds(rec); le = is_early_leave(rec); cp = camera_pct(rec)
@@ -574,16 +576,22 @@ async def post_daily_report():
         for m in role.members:
             if not m.bot and str(m.id) not in today:
                 rows.append({"name": m.display_name, "status": "noshow", "detail": "never joined a room",
-                             "hours": 0.0, "cam": 0.0})
+                             "hours": 0.0, "cam": 0.0, "away": 0.0})
+    rows.sort(key=lambda r: (r["status"] == "noshow", -r["hours"]))   # most IN on top, no-shows last
+    return rows
+
+async def post_daily_report():
+    ch = client.get_channel(LOG_CHANNEL_ID); start = scheduled_start_today()
+    if not ch or start is None: return
+    end_t = end_today() or dt.time(18, 0)
+    rows = build_daily_rows()
     if not rows: return
-    sev = {"noshow": 0, "late+early": 1, "late": 2, "early": 3, "gaps": 4, "ontime": 5}
-    rows.sort(key=lambda r: (sev.get(r["status"], 6), -r.get("away", 0)))  # problems first, most-out first
     day_label = now_pt().strftime("%A, %B %-d")
     buf = render_daily_card(day_label, start.strftime("%-I:%M %p"), end_t.strftime("%-I:%M %p"), rows)
     problems = sum(1 for r in rows if r["status"] != "ontime")
     e = discord.Embed(title=f"📋 Attendance — {day_label}",
-        description=(f"**{len(rows) - problems}/{len(rows)}** clean · "
-                     f"**{problems}** flagged — reds & yellows on top"),
+        description=(f"**{len(rows) - problems}/{len(rows)}** clean · **{problems}** flagged · "
+                     "most hours in rooms on top"),
         color=0xE23B3B if problems else 0x2ECC71)
     e.set_footer(text="Private · Pacific · AFK not counted")
     try:
@@ -611,11 +619,12 @@ async def post_autoflags(ch, guild):
     lines = []
     for c in flagged:
         bits = []
-        if c["late"]: bits.append(f"{c['late']} late")
-        if c["early"]: bits.append(f"{c['early']} early")
+        if c["late"]: bits.append(f"**{c['late']}× late**")
+        if c["early"]: bits.append(f"**{c['early']}× early leave**")
         if c.get("away", 0) >= AWAY_FLAG_WEEK_HOURS:
-            bits.append(f"**{c['away']:.1f}h out of rooms** during work hours")
-        lines.append(f"• **{c['name']}** — " + " / ".join(bits) + " (7 days)")
+            bits.append(f"**{c['away']:.1f}h out of rooms**")
+        lines.append(f"• **{c['name']}** — " + " · ".join(bits)
+                     + f" — only **{c.get('hours', 0):.1f}h in rooms** this week")
     owner = f"<@{guild.owner_id}> " if guild and guild.owner_id else ""
     e = discord.Embed(title="🚨 AUTO-FLAG — repeat offenders", description="\n".join(lines), color=0xC0392B)
     e.set_footer(text=f"Thresholds: {FLAG_LATE}+ late · {FLAG_EARLY}+ early · {AWAY_FLAG_WEEK_HOURS}h+ out of rooms, per 7 days")
@@ -1725,12 +1734,10 @@ def render_week_matrix(week_label, days, people):
     buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
     return buf
 
-async def post_weekly_attendance():
-    """Sunday: the detailed week grid — every person, every day, hours + status."""
-    ch = client.get_channel(LOG_CHANNEL_ID)
-    if not ch: return
+def build_week_people():
+    """This week's per-person, per-day grid data — GRINDERS ON TOP (total hours in)."""
     n = now_pt().date()
-    monday = n - dt.timedelta(days=n.weekday())          # this week's Monday (runs on Sunday)
+    monday = n - dt.timedelta(days=n.weekday())
     days = [monday + dt.timedelta(days=i) for i in range(6)]   # Mon..Sat
     hist = load_json(HISTORY_FILE, {})
     people_map = {}
@@ -1752,16 +1759,23 @@ async def post_weekly_attendance():
             p["cells"][i] = {"status": status, "hours": hrs}
             p["tot_h"] += hrs; p["cam_h"] += r.get("camera_seconds", 0) / 3600.0
             if not r.get("no_show"): p["tot_out"] += away
-    if not people_map: return
     people = []
     for p in people_map.values():
         p["cam"] = (p["cam_h"] / p["tot_h"]) if p["tot_h"] else 0.0
         people.append(p)
-    people.sort(key=lambda p: (p["l"] + p["e"] + p["ns"], p["tot_out"]), reverse=True)  # problems on top
+    people.sort(key=lambda p: -p["tot_h"])               # most hours in rooms on top
     label = f"{days[0].strftime('%b %-d')} – {days[-1].strftime('%b %-d, %Y')} · Mon–Sat"
+    return label, days, people
+
+async def post_weekly_attendance():
+    """Sunday: the detailed week grid — every person, every day, hours + status."""
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    if not ch: return
+    label, days, people = build_week_people()
+    if not people: return
     buf = render_week_matrix(label, days, people)
     e = discord.Embed(title=f"🗓️ Weekly Attendance Detail — week of {days[0].strftime('%b %-d')}",
-        description=f"**{len(people)}** tracked · problems sorted to the top",
+        description=f"**{len(people)}** tracked · most hours in rooms on top",
         color=0x3498DB)
     e.set_footer(text="Owner + trainers · full per-day breakdown")
     try:
@@ -1812,7 +1826,8 @@ async def ensure_commands_message():
             "**/mystats** — your week: hours, camera %, lates · your month: deals, AP, lead spend & ROI\n"
             "**/leaderboard** — this month's top 10 by personal AP + the team total\n"
             "**/team** — this month's top managers by team AP (full downlines)\n"
-            "**/pace** — where the month is tracking vs. where it'll land\n\n"
+            "**/pace** — where the month is tracking vs. where it'll land\n"
+            "**/attendance** — *(owner & trainers only)* today / week / month attendance views\n\n"
             "**Logging lead orders** → hit the button in <#" + str(LEAD_ROI_CH_ID) + "> every time you buy.\n"
             "*Tip: keep your server nickname set to your real name so the bot can match your production.*"),
         color=0x5865F2)
@@ -1930,6 +1945,174 @@ async def cmd_pace(interaction: discord.Interaction):
                      f"This week: **{wdeals['apps']} / {WEEKLY_APPS_GOAL} apps**\n`{bar(pct)}` {pct*100:.0f}%"),
         color=0x3498DB)
     await interaction.followup.send(embed=e, ephemeral=True)
+
+
+# ---- Hours vs Production quadrant (owner + trainers) -----------------------
+QUAD_COLORS = {"core": (46, 204, 113), "coach": (241, 196, 15),
+               "wild": (230, 126, 34), "exit": (231, 76, 60)}
+QUAD_KEY = [
+    ("core",  "THE CORE",      "high hours + high AP — feed them, clone them"),
+    ("coach", "COACHABLE",     "high hours, low AP — effort's there, fix the skill"),
+    ("wild",  "WILDCARDS",     "low hours, high AP — talent, culture risk"),
+    ("exit",  "DECISION TIME", "low hours, low AP — not showing, not writing"),
+]
+
+def build_quadrant_points(state):
+    """{name: {h: month hours in rooms, ap: month submitted AP}} — owner excluded."""
+    att = aggregate_month()
+    prod = _submitted_ap_by_agent(state, _live_month_key()) if state else {}
+    points = {}
+    for a in att.values():
+        nm = a["name"]; canon = (match_roster(state, nm) if state else None) or nm
+        if str(canon).lower() in IP_EXCLUDE: continue
+        p = points.setdefault(canon, {"h": 0.0, "ap": 0.0})
+        p["h"] += a["hours"]
+        if canon in prod: p["ap"] = float(prod[canon])
+    for nm, ap in prod.items():
+        if nm in points or str(nm).lower() in IP_EXCLUDE: continue
+        points[nm] = {"h": 0.0, "ap": float(ap)}          # writes but never in rooms
+    return points
+
+def _median(vals):
+    s = sorted(vals); n = len(s)
+    return 0 if not n else (s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2)
+
+def render_quadrant(points, month_label):
+    """Scatter of every rep: X = hours in rooms, Y = AP written. Median cross-hairs
+       split the floor into the four kinds of people; the key is printed on the card."""
+    if not HAVE_PIL or not points: return None
+    W, H = 1150, 940
+    PLOT = (110, 170, W - 60, H - 250)                    # x0,y0,x1,y1
+    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
+    tx = 44
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo = Image.open(LOGO_FILE).convert("RGBA").resize((96, 96), Image.LANCZOS)
+            img.paste(logo, (40, 32), logo); tx = 156
+        except Exception: pass
+    d.text((tx, 42), "HOURS vs PRODUCTION", font=_card_font(38, True), fill=CARD_GOLD)
+    d.text((tx, 94), f"{month_label} · every rep · hours in rooms → AP written", font=_card_font(21), fill=CARD_WHITE)
+    hs = [p["h"] for p in points.values()]; aps = [p["ap"] for p in points.values()]
+    max_h = max(max(hs) * 1.12, 1.0); max_ap = max(max(aps) * 1.12, 1.0)
+    med_h = _median(hs); med_ap = _median(aps)
+    x0, y0, x1, y1 = PLOT
+    def X(h): return x0 + (h / max_h) * (x1 - x0)
+    def Y(ap): return y1 - (ap / max_ap) * (y1 - y0)
+    mx, my = X(med_h), Y(med_ap)
+    # quadrant tints
+    for rect, key in (((mx, y0, x1, my), "core"), ((x0, y0, mx, my), "wild"),
+                      ((mx, my, x1, y1), "coach"), ((x0, my, mx, y1), "exit")):
+        d.rectangle(rect, fill=_blend(QUAD_COLORS[key], 0.13))
+    # median cross-hairs (dashed)
+    for yy in range(int(y0), int(y1), 14): d.line([mx, yy, mx, min(yy + 7, y1)], fill=CARD_GOLD, width=2)
+    for xx in range(int(x0), int(x1), 14): d.line([xx, my, min(xx + 7, x1), my], fill=CARD_GOLD, width=2)
+    d.rectangle(PLOT, outline=(70, 70, 78), width=2)
+    # axis labels
+    d.text((x0, y1 + 12), "0h", font=_card_font(17), fill=CARD_DIM)
+    d.text((x1 - 60, y1 + 12), f"{max_h:.0f}h in", font=_card_font(17), fill=CARD_DIM)
+    d.text((28, y0 - 4), f"${max_ap/1000:.0f}k", font=_card_font(16), fill=CARD_DIM)
+    d.text((28, y1 - 16), "$0", font=_card_font(16), fill=CARD_DIM)
+    d.text((mx + 6, y1 + 12), f"median {med_h:.0f}h", font=_card_font(16), fill=CARD_GOLD)
+    d.text((x0 + 6, my - 22), f"median ${med_ap/1000:.1f}k", font=_card_font(16), fill=CARD_GOLD)
+    # dots + names, colored by quadrant
+    lf = _card_font(16)
+    for nm, p in sorted(points.items(), key=lambda kv: -kv[1]["ap"]):
+        hx, hy = X(p["h"]), Y(p["ap"])
+        key = ("core" if p["h"] >= med_h and p["ap"] >= med_ap else
+               "wild" if p["ap"] >= med_ap else
+               "coach" if p["h"] >= med_h else "exit")
+        col = QUAD_COLORS[key]
+        d.ellipse([hx - 7, hy - 7, hx + 7, hy + 7], fill=col, outline=CARD_BLACK)
+        label = nm.split()[0][:10]
+        lx = hx + 11 if hx < x1 - 110 else hx - 11 - d.textlength(label, font=lf)
+        ly = max(y0 + 2, min(hy - 8, y1 - 18))
+        d.text((lx, ly), label, font=lf, fill=CARD_WHITE)
+    # THE KEY — the four kinds of people
+    ky = y1 + 42
+    d.text((44, ky), "THE FOUR KINDS OF PEOPLE", font=_card_font(21, True), fill=CARD_GOLD)
+    ky += 34
+    for key, name, desc in QUAD_KEY:
+        col = QUAD_COLORS[key]
+        d.ellipse([44, ky + 3, 60, ky + 19], fill=col)
+        nf = _card_font(19, True)
+        d.text((70, ky), name, font=nf, fill=col)
+        d.text((70 + d.textlength(name, font=nf) + 14, ky + 2), "— " + desc,
+               font=_card_font(17), fill=CARD_WHITE)
+        ky += 33
+    d.text((44, H - 46), "dot = one rep · cross-hairs = team medians · owner + trainers only · EXCEL FINANCIAL",
+           font=_card_font(15), fill=CARD_DIM)
+    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
+    return buf
+
+async def post_quadrant():
+    """Sunday: the hours-vs-production quadrant to #attendance-log (owner + trainers)."""
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    if not ch: return
+    state = await fetch_app_state() if SUPABASE_KEY else None
+    points = build_quadrant_points(state)
+    if len(points) < 2: return
+    buf = render_quadrant(points, _month_label(_live_month_key()))
+    if not buf: return
+    try: await ch.send(file=discord.File(buf, filename="quadrant.png"))
+    except Exception as ex: print("quadrant", ex)
+
+def _can_view_attendance(user):
+    guild = client.get_guild(GUILD_ID)
+    if not guild: return False
+    if user.id == guild.owner_id: return True
+    member = guild.get_member(user.id)
+    return bool(member and any(r.id == TRAINER_ROLE_ID for r in member.roles))
+
+@tree.command(name="attendance", description="Owner/trainers: attendance — today, this week, or this month",
+              guild=discord.Object(GUILD_ID))
+@discord.app_commands.describe(period="Which view do you want?")
+@discord.app_commands.choices(period=[
+    discord.app_commands.Choice(name="today", value="today"),
+    discord.app_commands.Choice(name="this week", value="week"),
+    discord.app_commands.Choice(name="this month", value="month"),
+    discord.app_commands.Choice(name="hours vs production", value="quad")])
+async def cmd_attendance(interaction: discord.Interaction, period: discord.app_commands.Choice[str]):
+    if not _can_view_attendance(interaction.user):
+        return await interaction.response.send_message("⛔ Owner and trainers only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    p = period.value
+    try:
+        if p == "today":
+            ensure_today()
+            rows = build_daily_rows()
+            if not rows: return await interaction.followup.send("No attendance data yet today.", ephemeral=True)
+            start = scheduled_start_today() or dt.time(9, 0); end_t = end_today() or dt.time(18, 0)
+            buf = render_daily_card(now_pt().strftime("%A, %B %-d"),
+                                    start.strftime("%-I:%M %p"), end_t.strftime("%-I:%M %p"), rows)
+            if buf: return await interaction.followup.send(file=discord.File(buf, "today.png"), ephemeral=True)
+        elif p == "week":
+            label, days, people = build_week_people()
+            if not people: return await interaction.followup.send("No attendance data for this week yet.", ephemeral=True)
+            buf = render_week_matrix(label, days, people)
+            if buf: return await interaction.followup.send(file=discord.File(buf, "week.png"), ephemeral=True)
+        elif p == "quad":
+            state = await fetch_app_state() if SUPABASE_KEY else None
+            points = build_quadrant_points(state)
+            if len(points) < 2: return await interaction.followup.send("Not enough data yet for the quadrant.", ephemeral=True)
+            buf = render_quadrant(points, _month_label(_live_month_key()))
+            if buf: return await interaction.followup.send(file=discord.File(buf, "quadrant.png"), ephemeral=True)
+        else:  # month
+            agg = aggregate_month()
+            if not agg: return await interaction.followup.send("No attendance data this month yet.", ephemeral=True)
+            rows = sorted(agg.values(), key=lambda a: -a["hours"])   # grinders on top
+            card_rows = [(a["name"], f"{a['hours']:.1f}h · {a['late']}L {a['early']}E {a['noshow']}NS")
+                         for a in rows[:20]]
+            total_h = sum(a["hours"] for a in rows)
+            buf = render_card("Monthly Attendance", f"{_month_label(_live_month_key())} · "
+                              f"{total_h:.0f} team hours · most in on top",
+                              card_rows, "EXCEL FINANCIAL · HOURS IN ROOMS · L=LATE E=EARLY NS=NO-SHOW")
+            if buf: return await interaction.followup.send(file=discord.File(buf, "month.png"), ephemeral=True)
+        await interaction.followup.send("Couldn't render that view.", ephemeral=True)
+    except Exception as ex:
+        print("attendance cmd", ex)
+        try: await interaction.followup.send("Something went wrong building that view.", ephemeral=True)
+        except Exception: pass
 
 
 # ---- monthly analytics (1st of month) --------------------------------------
@@ -2054,6 +2237,7 @@ async def scheduler():
         _last_weekly = n.date()
         await post_sunday_wrap()       # ONE public wrap + private accountability + roles
         await post_weekly_attendance() # detailed per-day week grid (owner + trainers)
+        await post_quadrant()          # hours-vs-production quadrant (owner + trainers)
         await post_lead_roi()          # weekly lead-spend ROI scoreboard (public)
         await post_lead_report()       # lead-buying breakdown (owner-only)
         await refresh_team_ap_board()  # keep the live manager board fresh
