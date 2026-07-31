@@ -69,8 +69,9 @@ WEEKLY_PUBLIC_CH_ID   = 1531496475379499222
 TOKEN   = os.environ.get("DISCORD_TOKEN")
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
+# Late = joining after these start times. Monday 8:30 AM huddle; Tue–Sat 9:00 AM. Sunday off.
 SCHEDULE = {0: dt.time(8, 30), 1: dt.time(9, 0), 2: dt.time(9, 0),
-            3: dt.time(8, 30), 4: dt.time(9, 0), 5: dt.time(9, 0), 6: None}
+            3: dt.time(9, 0), 4: dt.time(9, 0), 5: dt.time(9, 0), 6: None}
 # Per-day end of the call session (early-leave cutoff & daily report time).
 END_BY_DAY  = {0: dt.time(18, 0), 1: dt.time(18, 0), 2: dt.time(18, 0),
                3: dt.time(18, 0), 4: dt.time(18, 0), 5: dt.time(14, 0)}  # Sat ends 2 PM
