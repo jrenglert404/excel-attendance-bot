@@ -1999,12 +1999,17 @@ def _median(vals):
     s = sorted(vals); n = len(s)
     return 0 if not n else (s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2)
 
+def _fmt_money(ap):
+    return f"${ap/1000:.1f}k" if ap >= 1000 else f"${ap:,.0f}"
+
 def render_quadrant(points, month_label):
-    """Scatter of every rep: X = hours in rooms, Y = AP written. Median cross-hairs
-       split the floor into the four kinds of people; the key is printed on the card."""
+    """Every rep plotted into FOUR EQUAL SQUARES. Split is by team median (value),
+       but position inside each half is by RANK, so a skewed floor (half the team at
+       $0) still spreads out readably instead of piling on the axis. Each dot carries
+       the rep's real hours + AP underneath."""
     if not HAVE_PIL or not points: return None
-    W, H = 1150, 940
-    PLOT = (110, 170, W - 60, H - 250)                    # x0,y0,x1,y1
+    W, H = 1150, 980
+    PLOT = (90, 170, W - 60, H - 260)                    # x0,y0,x1,y1
     img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
     d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
     tx = 44
@@ -2014,42 +2019,61 @@ def render_quadrant(points, month_label):
             img.paste(logo, (40, 32), logo); tx = 156
         except Exception: pass
     d.text((tx, 42), "HOURS vs PRODUCTION", font=_card_font(38, True), fill=CARD_GOLD)
-    d.text((tx, 94), f"{month_label} · every rep · hours in rooms → AP written", font=_card_font(21), fill=CARD_WHITE)
+    d.text((tx, 94), f"{month_label} · every rep · four equal squares, ranked within each half",
+           font=_card_font(21), fill=CARD_WHITE)
     hs = [p["h"] for p in points.values()]; aps = [p["ap"] for p in points.values()]
-    max_h = max(max(hs) * 1.12, 1.0); max_ap = max(max(aps) * 1.12, 1.0)
     med_h = _median(hs); med_ap = _median(aps)
     x0, y0, x1, y1 = PLOT
-    def X(h): return x0 + (h / max_h) * (x1 - x0)
-    def Y(ap): return y1 - (ap / max_ap) * (y1 - y0)
-    mx, my = X(med_h), Y(med_ap)
-    # quadrant tints
+    mx = (x0 + x1) / 2; my = (y0 + y1) / 2               # equal squares, always
+    def _fractions(vals_by_name, med):
+        """{name: 0..1} — below-median names spread across [0,.5), rest across [.5,1]."""
+        lows  = sorted([nm for nm, v in vals_by_name.items() if v <  med], key=lambda n: (vals_by_name[n], n))
+        highs = sorted([nm for nm, v in vals_by_name.items() if v >= med], key=lambda n: (vals_by_name[n], n))
+        out = {}
+        for i, nm in enumerate(lows):  out[nm] = ((i + 0.5) / max(len(lows), 1)) * 0.46 + 0.02
+        for i, nm in enumerate(highs): out[nm] = 0.52 + ((i + 0.5) / max(len(highs), 1)) * 0.46
+        return out
+    fx = _fractions({nm: p["h"] for nm, p in points.items()}, med_h)
+    fy = _fractions({nm: p["ap"] for nm, p in points.items()}, med_ap)
+    # quadrant tints — four EQUAL squares
     for rect, key in (((mx, y0, x1, my), "core"), ((x0, y0, mx, my), "wild"),
                       ((mx, my, x1, y1), "coach"), ((x0, my, mx, y1), "exit")):
         d.rectangle(rect, fill=_blend(QUAD_COLORS[key], 0.13))
-    # median cross-hairs (dashed)
     for yy in range(int(y0), int(y1), 14): d.line([mx, yy, mx, min(yy + 7, y1)], fill=CARD_GOLD, width=2)
     for xx in range(int(x0), int(x1), 14): d.line([xx, my, min(xx + 7, x1), my], fill=CARD_GOLD, width=2)
     d.rectangle(PLOT, outline=(70, 70, 78), width=2)
-    # axis labels
-    d.text((x0, y1 + 12), "0h", font=_card_font(17), fill=CARD_DIM)
-    d.text((x1 - 60, y1 + 12), f"{max_h:.0f}h in", font=_card_font(17), fill=CARD_DIM)
-    d.text((28, y0 - 4), f"${max_ap/1000:.0f}k", font=_card_font(16), fill=CARD_DIM)
-    d.text((28, y1 - 16), "$0", font=_card_font(16), fill=CARD_DIM)
-    d.text((mx + 6, y1 + 12), f"median {med_h:.0f}h", font=_card_font(16), fill=CARD_GOLD)
-    d.text((x0 + 6, my - 22), f"median ${med_ap/1000:.1f}k", font=_card_font(16), fill=CARD_GOLD)
-    # dots + names, colored by quadrant
-    lf = _card_font(16)
+    d.text((x0, y1 + 12), "fewer hours", font=_card_font(16), fill=CARD_DIM)
+    d.text((x1 - 110, y1 + 12), "more hours →", font=_card_font(16), fill=CARD_DIM)
+    d.text((mx - 90, y1 + 12), f"team median {med_h:.0f}h", font=_card_font(16), fill=CARD_GOLD)
+    d.text((x0 + 6, my - 22), f"median {_fmt_money(med_ap)}", font=_card_font(16), fill=CARD_GOLD)
+    d.text((28, y0 - 26), "more AP ↑", font=_card_font(16), fill=CARD_DIM)
+    # dots + two-line labels with collision nudging
+    nf = _card_font(16, True); vf = _card_font(13)
+    placed = []
+    def _free(bx):
+        return all(bx[2] < o[0] or bx[0] > o[2] or bx[3] < o[1] or bx[1] > o[3] for o in placed)
     for nm, p in sorted(points.items(), key=lambda kv: -kv[1]["ap"]):
-        hx, hy = X(p["h"]), Y(p["ap"])
+        hx = x0 + fx[nm] * (x1 - x0)
+        hy = y1 - fy[nm] * (y1 - y0)
         key = ("core" if p["h"] >= med_h and p["ap"] >= med_ap else
                "wild" if p["ap"] >= med_ap else
                "coach" if p["h"] >= med_h else "exit")
         col = QUAD_COLORS[key]
         d.ellipse([hx - 7, hy - 7, hx + 7, hy + 7], fill=col, outline=CARD_BLACK)
-        label = nm.split()[0][:10]
-        lx = hx + 11 if hx < x1 - 110 else hx - 11 - d.textlength(label, font=lf)
-        ly = max(y0 + 2, min(hy - 8, y1 - 18))
-        d.text((lx, ly), label, font=lf, fill=CARD_WHITE)
+        name = nm.split()[0][:11]
+        val = f"{p['h']:.0f}h · {_fmt_money(p['ap'])}"
+        w = max(d.textlength(name, font=nf), d.textlength(val, font=vf))
+        lx = hx + 11 if hx < x1 - (w + 20) else hx - 11 - w
+        base = max(y0 + 2, min(hy - 10, y1 - 36))
+        ly = base
+        for dy in (0, 20, -20, 40, -40, 60):
+            cand = (lx - 2, base + dy, lx + w + 2, base + dy + 34)
+            if y0 <= cand[1] and cand[3] <= y1 + 34 and _free(cand):
+                ly = base + dy; placed.append(cand); break
+        else:
+            placed.append((lx - 2, ly, lx + w + 2, ly + 34))
+        d.text((lx, ly), name, font=nf, fill=CARD_WHITE)
+        d.text((lx, ly + 17), val, font=vf, fill=CARD_DIM)
     # THE KEY — the four kinds of people
     ky = y1 + 42
     d.text((44, ky), "THE FOUR KINDS OF PEOPLE", font=_card_font(21, True), fill=CARD_GOLD)
