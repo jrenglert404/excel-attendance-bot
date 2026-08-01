@@ -1707,6 +1707,86 @@ async def refresh_lead_roi_board():
         await ch.send(embed=e, file=f) if f else await ch.send(embed=e)
     except Exception as ex: print("roi send", ex)
 
+# ---- THE FORMULA (#team-production, Sundays) --------------------------------
+# The public proof: top producers next to their hours on the floor and lead spend.
+# Hours + leads = money — the card makes the correlation impossible to miss.
+def render_formula_card(rows, month_label, insight):
+    if not HAVE_PIL or not rows: return None
+    W, row_h, top = 1150, 58, 210
+    H = top + len(rows) * row_h + 116
+    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
+    tx = 44
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo = Image.open(LOGO_FILE).convert("RGBA").resize((96, 96), Image.LANCZOS)
+            img.paste(logo, (40, 34), logo); tx = 158
+        except Exception: pass
+    d.text((tx, 44), "THE FORMULA", font=_card_font(40, True), fill=CARD_GOLD)
+    d.text((tx, 98), f"{month_label} · hours on the floor + leads in the pipe = AP on the board",
+           font=_card_font(21), fill=CARD_WHITE)
+    XS = {"ap": 700, "hours": 850, "spend": 1000, "roi": 1105}
+    hf = _card_font(18, True)
+    for key, lab in (("ap", "AP"), ("hours", "HOURS"), ("spend", "LEADS $"), ("roi", "ROI")):
+        w = d.textlength(lab, font=hf)
+        d.text((XS[key] - w, top - 34), lab, font=hf, fill=CARD_DIM)
+    d.line([36, top - 8, W - 36, top - 8], fill=CARD_GOLD, width=2)
+    nf, vf, af = _card_font(24, True), _card_font(22), _card_font(23, True)
+    y = top + 6
+    for i, r in enumerate(rows, 1):
+        if i % 2 == 0:
+            d.rectangle([28, y - 6, W - 28, y + row_h - 14], fill=(22, 22, 27))
+        d.text((44, y + 2), f"{i}", font=_card_font(22, True), fill=CARD_GOLD if i <= 3 else CARD_DIM)
+        d.text((92, y), str(r["a"]), font=nf, fill=CARD_WHITE)
+        w = d.textlength(_kfmt(r["ap"]), font=af)
+        d.text((XS["ap"] - w, y + 1), _kfmt(r["ap"]), font=af, fill=CARD_GOLD)
+        for key, txt, on in (("hours", f"{r['h']:.0f}h", r["h"] > 0),
+                             ("spend", _kfmt(r["sp"]) if r["sp"] > 0 else "—", r["sp"] > 0)):
+            w = d.textlength(txt, font=vf)
+            d.text((XS[key] - w, y + 2), txt, font=vf, fill=CARD_WHITE if on else CARD_DIM)
+        rtxt = f"{(r['ap']/r['sp']):.1f}x" if r["sp"] > 0 else "—"
+        w = d.textlength(rtxt, font=vf)
+        d.text((XS["roi"] - w, y + 2), rtxt, font=vf, fill=CARD_GOLD if r["sp"] > 0 else CARD_DIM)
+        d.line([36, y + row_h - 12, W - 36, y + row_h - 12], fill=CARD_LINE, width=1)
+        y += row_h
+    d.text((44, H - 82), insight, font=_card_font(20, True), fill=CARD_GOLD)
+    d.text((44, H - 50), "month-to-date · AP = submitted · hours = ALL Discord time · EXCEL FINANCIAL",
+           font=_card_font(17), fill=CARD_DIM)
+    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
+    return buf
+
+async def post_formula_card():
+    """Sunday, #team-production: top 10 producers with their hours + lead spend, plus a
+       one-line top-5-vs-everyone-else comparison that makes the correlation obvious."""
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(TEAM_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state: return
+    mkey = _live_month_key(); label = _month_label(mkey)
+    prod = _submitted_ap_by_agent(state, mkey)
+    lead_tot = _agent_lead_totals(await fetch_lead_purchases(mkey))
+    hours_by_canon = {}
+    for a in aggregate_month().values():
+        canon = match_roster(state, a["name"]) or a["name"]
+        hours_by_canon[canon] = hours_by_canon.get(canon, 0.0) + a["hours"]
+    roster = [str(x) for x in (state.get("roster") or []) if str(x).lower() not in IP_EXCLUDE]
+    allrows = [{"a": a, "ap": float(prod.get(a, 0) or 0), "h": hours_by_canon.get(a, 0.0),
+                "sp": float((lead_tot.get(a) or {}).get("spend", 0) or 0)} for a in roster]
+    allrows.sort(key=lambda r: -r["ap"])
+    rows = [r for r in allrows if r["ap"] > 0][:10]
+    if len(rows) < 3: return                                # not enough signal yet this month
+    top5, rest = allrows[:5], allrows[5:]
+    def _avg(rs, k): return (sum(r[k] for r in rs) / len(rs)) if rs else 0.0
+    insight = (f"Top 5: {_avg(top5,'h'):.0f}h · ${_avg(top5,'sp'):,.0f} leads · ${_avg(top5,'ap'):,.0f} AP avg"
+               + (f"   vs   everyone else: {_avg(rest,'h'):.0f}h · ${_avg(rest,'sp'):,.0f} · ${_avg(rest,'ap'):,.0f}"
+                  if rest else ""))
+    buf = render_formula_card(rows, label, insight)
+    if not buf: return
+    try: await ch.send(content="**🧪 THE FORMULA** — hours + leads = money. The board proves it every week.",
+                       file=discord.File(buf, "formula.png"))
+    except Exception as ex: print("formula", ex)
+
 async def post_lead_report():
     """Owner-only breakdown of WHAT the team is buying — by lead type and by vendor."""
     if not SUPABASE_KEY: return
@@ -2875,6 +2955,7 @@ async def scheduler():
         await send_report_cards()      # every rep's private DM report card
         await post_quadrant()          # hours-vs-production quadrant (owner + trainers)
         await refresh_lead_roi_board() # keep the live ROI board fresh
+        await post_formula_card()      # top producers vs hours & lead spend (#team-production)
         await post_lead_report()       # lead-buying breakdown (owner-only)
         await refresh_team_ap_board()  # keep the live manager board fresh
     # IP Reports are import-driven (see ip_poller) — no fixed weekly/monthly schedule.
