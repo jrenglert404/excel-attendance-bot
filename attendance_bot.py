@@ -134,7 +134,7 @@ IP_EXCLUDE       = {"jesse englert"}   # names kept off the public board (owner'
 #     rolling monthly tally. Public #lead-roi shows spend-vs-results totals; a private
 #     owner report breaks down by lead type & vendor. ---
 LEAD_ROI_CH_ID    = 1531853384309669960   # #lead-roi  (public totals scoreboard)
-LEAD_REPORT_CH_ID = 1531859358479155220   # #lead-report (owner-only type/vendor breakdown)
+LEAD_REPORT_CH_ID = 1531721169722675361   # lead-buying breakdown now posts to #ip-reports (lead-report merged in, Aug 2026)
 LEAD_TABLE        = "lead_purchases"       # Supabase append-only log (see setup SQL in README)
 
 # --- Team Production: manager leaderboard, each rep's downline rolled up the hierarchy
