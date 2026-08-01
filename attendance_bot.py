@@ -2579,12 +2579,18 @@ BUILDER_CHECK = dt.time(14, 1)       # roll at 2:01 sharp — builders show up o
 BUILDER_FILE  = "builder_state.json"
 
 async def post_builder_roll():
-    """Who actually showed up for the Saturday 2 PM builder call — owner + trainers."""
+    """Who actually showed up for the Saturday 2 PM builder call — OWNER ONLY (#ip-reports).
+       Also names who was on the floor today but skipped the call: leadership intel."""
     guild = client.get_guild(GUILD_ID)
-    ch = client.get_channel(LOG_CHANNEL_ID)
+    ch = client.get_channel(IP_REPORTS_CH_ID)
     if not (guild and ch): return
-    present = sorted({mem.display_name for vc in guild.voice_channels if is_work_channel(vc)
-                      for mem in vc.members if not mem.bot})
+    BUILDER_VC_ID = 1530612428256313436          # the call happens in the Excel Financial room
+    call_vc = guild.get_channel(BUILDER_VC_ID)
+    present = sorted({mem.display_name for mem in (call_vc.members if call_vc else [])
+                      if not mem.bot})
+    elsewhere = sorted({mem.display_name for vc in guild.voice_channels
+                        if is_work_channel(vc) and vc.id != BUILDER_VC_ID
+                        for mem in vc.members if not mem.bot})
     hist = load_json(BUILDER_FILE, {})
     hist[today_key()] = present
     hist = {k: hist[k] for k in sorted(hist)[-12:]}     # keep ~3 months
@@ -2601,9 +2607,20 @@ async def post_builder_roll():
     body = "\n".join(f"• {nm}" + (f" — {streaks[nm]} in a row" if streaks.get(nm, 0) > 1 else "")
                      for nm in present) or "Nobody. Empty room."
     e = discord.Embed(title=f"🔨 Builder Call Roll — {now_pt().strftime('%b %-d')}",
-        description=f"**{len(present)}** showed up at 2 PM:\n{body}",
+        description=f"**{len(present)}** on the call in Excel Financial at 2 PM:\n{body}",
         color=0x2ECC71 if present else 0xE23B3B)
-    e.set_footer(text="Owner + trainers · roll taken 2:01 PM sharp · builders show up on time")
+    # leadership intel: on the floor today, but NOT on the builder call
+    ensure_today()
+    if elsewhere:
+        e.add_field(name=f"🚪 In ANOTHER room during the call ({len(elsewhere)})",
+            value="\n".join("• " + n for n in elsewhere[:20]), inline=False)
+    skipped = sorted({rec["name"] for rec in today.values()
+                      if live_seconds(rec) > 0 and rec["name"] not in present
+                      and rec["name"] not in elsewhere})
+    if skipped:
+        e.add_field(name=f"👀 Worked today but skipped the call ({len(skipped)})",
+            value="\n".join("• " + n for n in skipped[:20]), inline=False)
+    e.set_footer(text="Owner only · roll taken 2:01 PM sharp · builders show up on time")
     try: await ch.send(embed=e)
     except Exception as ex: print("builder roll", ex)
 
