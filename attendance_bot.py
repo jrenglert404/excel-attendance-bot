@@ -1220,6 +1220,7 @@ async def wins_poller():
         await check_streaks(new_agents)
         await refresh_team_ap_board()   # live team-production board follows new deals
         await refresh_lead_roi_board()  # ROI board moves with every submitted deal
+        await refresh_leaders_board()   # 💰 crown can change hands on a new deal
 
 async def check_milestones():
     rec = client.get_channel(RECOGNITION_CH_ID)
@@ -1564,6 +1565,8 @@ class LeadOrderModal(discord.ui.Modal, title="Log a Lead Order"):
             f"Only monthly totals are public — your individual orders stay private.")
         try: await refresh_lead_roi_board()             # board moves the moment an order lands
         except Exception as ex: print("roi after order", ex)
+        try: await refresh_leaders_board()              # 💸 crown can change hands on a new order
+        except Exception as ex: print("leaders after order", ex)
 
 def lead_button():
     v = discord.ui.View(timeout=None)
@@ -1754,6 +1757,57 @@ def render_formula_card(rows, month_label, insight):
            font=_card_font(17), fill=CARD_DIM)
     buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
     return buf
+
+# ---- 👑 LEADING THE WAY (#recognition) --------------------------------------
+# One live message, edited all month: three crowns for the three ways to lead —
+# most hours on the floor, most invested in leads, most business written.
+# When the month flips, the old board freezes as a record and a new one starts.
+async def refresh_leaders_board():
+    if not SUPABASE_KEY: return
+    ch = client.get_channel(RECOGNITION_CH_ID)
+    if not ch: return
+    state = await fetch_app_state()
+    if not state: return
+    mkey = _live_month_key(); label = _month_label(mkey)
+    prod = _submitted_ap_by_agent(state, mkey)
+    chips = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
+    lead_tot = _agent_lead_totals(await fetch_lead_purchases(mkey))
+    hours = {}
+    for a in aggregate_month().values():
+        canon = match_roster(state, a["name"]) or a["name"]
+        if str(canon).lower() in IP_EXCLUDE: continue
+        hours[canon] = hours.get(canon, 0.0) + a["hours"]
+    spend = {a: t["spend"] for a, t in lead_tot.items()
+             if t["spend"] > 0 and str(a).lower() not in IP_EXCLUDE}
+    ap = {a: float(v or 0) for a, v in prod.items()
+          if float(v or 0) > 0 and str(a).lower() not in IP_EXCLUDE}
+    def crown(d, fmt):
+        if not d: return "_This crown is unclaimed — take it._"
+        nm = max(d, key=d.get)
+        return f"👑 **{nm}** — {fmt(nm, d[nm])}"
+    e = discord.Embed(title=f"👑 Leading the Way — {label}",
+        description=("Three ways to lead. Pick one and own it — this board updates itself "
+                     "all month, and the crowns move the second someone outworks you."),
+        color=0xD4AF37)
+    e.add_field(name="⏱️ THE FLOOR GENERAL — most hours worked",
+        value=crown(hours, lambda n, v: f"**{v:.1f}h** in the rooms"), inline=False)
+    e.add_field(name="💸 THE INVESTOR — most spent on leads",
+        value=crown(spend, lambda n, v: f"**${int(round(v)):,}** on leads"
+                    + (f" · {lead_tot[n]['leads']} leads" if n in lead_tot else "")), inline=False)
+    e.add_field(name="💰 THE CLOSER — most business written",
+        value=crown(ap, lambda n, v: f"**${int(round(v)):,} AP** · {len(chips.get(n) or [])} deals"), inline=False)
+    e.set_footer(text="Month-to-date · hours = ALL Discord time · updates automatically · EXCEL FINANCIAL")
+    this_title = f"👑 Leading the Way — {label}"
+    async for m in ch.history(limit=50):
+        if m.author == client.user and m.embeds and (m.embeds[0].title or "") == this_title:
+            try: await m.edit(embed=e)
+            except Exception as ex: print("leaders edit", ex)
+            return
+    try:
+        msg = await ch.send(embed=e)
+        try: await msg.pin()
+        except Exception: pass
+    except Exception as ex: print("leaders send", ex)
 
 async def post_formula_card():
     """Sunday, #team-production: top 10 producers with their hours + lead spend, plus a
@@ -2107,6 +2161,8 @@ async def refresh_hours_boards():
 async def hours_boards_loop():
     try: await refresh_hours_boards()
     except Exception as ex: print("hours boards", ex)
+    try: await refresh_leaders_board()      # crowns move as hours climb
+    except Exception as ex: print("leaders board", ex)
 
 async def post_team_ip_monthly():
     """End-of-month manager board on ISSUED IP (a fresh post, not an edit)."""
