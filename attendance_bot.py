@@ -372,6 +372,27 @@ def scheduled_week_hours():
                   - dt.datetime.combine(dt.date.today(), start)).total_seconds() / 3600.0
     return round(total, 1)
 
+def scheduled_day_hours(d):
+    """Scheduled floor hours for one calendar date (0 for Sunday/unscheduled)."""
+    start = SCHEDULE.get(d.weekday()); end = END_BY_DAY.get(d.weekday())
+    if start is None or end is None: return 0.0
+    return (dt.datetime.combine(d, end) - dt.datetime.combine(d, start)).total_seconds() / 3600.0
+
+def scheduled_hours_to_date(dates):
+    """Scheduled floor hours already ON THE BOOKS for these dates — past days count
+       in full, today only up to right now, future days count zero. So a rep checking
+       /mystats mid-week is measured against what was actually possible so far, not
+       against days that haven't happened yet."""
+    n = now_pt(); tdy = n.date(); cur = n.replace(tzinfo=None); total = 0.0
+    for d in dates:
+        if d > tdy: continue
+        if d < tdy: total += scheduled_day_hours(d); continue
+        start = SCHEDULE.get(d.weekday()); end = END_BY_DAY.get(d.weekday())
+        if start is None or end is None: continue
+        s = dt.datetime.combine(d, start); e = dt.datetime.combine(d, end)
+        if cur > s: total += (min(cur, e) - s).total_seconds() / 3600.0
+    return total
+
 def window_span_seconds():
     """Seconds of the scheduled work window (start -> end) elapsed so far today."""
     start = scheduled_start_today(); end = end_today()
@@ -2026,7 +2047,7 @@ async def ensure_commands_message():
     e = discord.Embed(title="🤖 Excel Bot — Commands",
         description=(
             "Type `/` in any channel and pick a command. **Answers are private — only you see them.**\n\n"
-            "**/mystats** — your week: hours, camera %, lates · your month: deals, AP, lead spend & ROI\n"
+            "**/mystats** — your week: hours, camera %, lates · your month: deals, AP, **progress toward your goal & commit**, lead spend vs lead commit & ROI\n"
             "**/attendance** — *(owner & trainers only)* today / week / month / hours-vs-production views\n\n"
             "Leaderboards live in <#" + str(TEAM_CH_ID) + "> — updated live, all month.\n"
             "**Logging lead orders** → hit the button in <#" + str(LEAD_ROI_CH_ID) + "> every time you buy.\n"
@@ -2046,19 +2067,43 @@ async def ensure_commands_message():
 
 def _fmt_x(ap, spend): return f"{ap/spend:.1f}x" if spend else "—"
 
-@tree.command(name="mystats", description="Your private stats — week attendance + month production", guild=discord.Object(GUILD_ID))
+def _pbar(cur, target, width=12):
+    """Text progress bar: ▰▰▰▰▱▱▱▱▱▱▱▱"""
+    if target <= 0: return ""
+    filled = max(0, min(width, int(round(cur / target * width))))
+    return "▰" * filled + "▱" * (width - filled)
+
+def _goal_line(cur, target):
+    """'$4,200 / $10,000 · ▰▰▰▰▰▱▱▱▱▱▱▱ 42% · $5,800 to go' (or HIT)."""
+    pct = (cur / target * 100) if target else 0
+    left = target - cur
+    tail = "✅ **HIT**" if left <= 0 else f"${int(round(left)):,} to go"
+    return f"${int(round(cur)):,} / ${int(round(target)):,}\n{_pbar(cur, target)} **{pct:.0f}%** · {tail}"
+
+@tree.command(name="mystats", description="Your private stats — attendance, goal & commit progress, production, lead spend", guild=discord.Object(GUILD_ID))
 async def cmd_mystats(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     name = interaction.user.display_name
     lines = []
     row = next((r for r in aggregate_week().values()
                 if r["name"].strip().lower() == name.strip().lower()), None)
+    tdy = now_pt().date()
+    wk_poss = scheduled_hours_to_date([tdy - dt.timedelta(days=i) for i in range(7)])
     if row:
         campct = (row["cam"] / row["hours"] * 100) if row["hours"] else 0
-        lines.append(f"**This week:** {row['hours']:.1f}h on the floor · out {row.get('away', 0):.1f}h · "
-                     f"camera {campct:.0f}% · {row['late']} late · {row['early']} early leave")
+        wk_pct = (row["hours"] / wk_poss * 100) if wk_poss else 0
+        lines.append(f"**This week:** {row['hours']:.1f}h of {wk_poss:.1f}h possible — **{wk_pct:.0f}%** on the floor\n"
+                     f"out {row.get('away', 0):.1f}h · camera {campct:.0f}% · {row['late']} late · {row['early']} early leave")
     else:
-        lines.append("**This week:** no floor time logged yet")
+        lines.append(f"**This week:** 0h of {wk_poss:.1f}h possible — no floor time logged yet")
+    mrow = next((r for r in aggregate_month().values()
+                 if r["name"].strip().lower() == name.strip().lower()), None)
+    mo_poss = scheduled_hours_to_date([tdy.replace(day=1) + dt.timedelta(days=i)
+                                       for i in range((tdy - tdy.replace(day=1)).days + 1)])
+    if mo_poss:
+        mo_hours = mrow["hours"] if mrow else 0.0
+        lines.append(f"**This month:** {mo_hours:.1f}h of {mo_poss:.1f}h possible — "
+                     f"**{(mo_hours / mo_poss * 100):.0f}%** on the floor")
     if SUPABASE_KEY:
         state = await fetch_app_state()
         canon = match_roster(state, name) if state else None
@@ -2070,10 +2115,27 @@ async def cmd_mystats(interaction: discord.Interaction):
             lines.append(f"**{_month_label(mkey)}:** {my_deals} deals · **${int(round(my_ap)):,} AP**")
             ipv = _net_map(state, mkey).get(canon)
             if ipv: lines.append(f"**Issued IP:** ${int(round(ipv)):,}")
+            # --- goal & commit progression (straight from the tracker) ----------
+            mblob = ((state.get("months") or {}).get(mkey) or {})
+            my_commit = float((mblob.get("commits") or {}).get(canon) or 0)
+            my_goal   = float((mblob.get("goals") or {}).get(canon) or 0)
+            if my_commit:
+                lines.append(f"🎯 **Commit:** {_goal_line(my_ap, my_commit)}")
+            if my_goal:
+                lines.append(f"🏆 **Goal:** {_goal_line(my_ap, my_goal)}")
+            if not my_commit and not my_goal:
+                lines.append("_No commit or goal set for this month — enter them in the tracker._")
+            # --- lead spend vs lead commit --------------------------------------
+            lead_commit = float((mblob.get("leadCommits") or {}).get(canon) or 0)
             t = _agent_lead_totals(await fetch_lead_purchases(mkey)).get(canon)
-            if t:
-                lines.append(f"**Lead spend:** ${int(round(t['spend'])):,} · {t['leads']} leads · "
-                             f"AP return {_fmt_x(my_ap, t['spend'])}")
+            spend = t["spend"] if t else float((mblob.get("leadSpends") or {}).get(canon) or 0)
+            if spend or lead_commit:
+                seg = f"💸 **Lead spend:** ${int(round(spend)):,}"
+                if lead_commit:
+                    seg += f" of ${int(round(lead_commit)):,} committed ({(spend / lead_commit * 100):.0f}%)"
+                if t:
+                    seg += f" · {t['leads']} leads · AP return {_fmt_x(my_ap, t['spend'])}"
+                lines.append(seg)
         else:
             lines.append("_Couldn't match your nickname to the roster — set your server nickname to your real name._")
         try:
