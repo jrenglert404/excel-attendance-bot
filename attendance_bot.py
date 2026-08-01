@@ -78,8 +78,6 @@ END_BY_DAY  = {0: dt.time(18, 0), 1: dt.time(18, 0), 2: dt.time(18, 0),
                3: dt.time(18, 0), 4: dt.time(18, 0), 5: dt.time(14, 0)}  # Sat ends 2 PM
 WEEKLY_TIME = dt.time(18, 0)
 DEALS_DAILY_TIME = dt.time(21, 0)   # daily deals total posts at 9 PM PT (after late closes)
-WEEK_MATRIX_DAY  = 5                 # Saturday…
-WEEK_MATRIX_TIME = dt.time(15, 0)    # …3 PM PT — full Mon–Sat week is in the books by then
 WEEKLY_DAY  = 6                 # Sunday — the 6 PM PT "Sunday Wrap"
 MONTHLY_TIME = dt.time(10, 0)   # month-close reports post at 10 AM PT...
 MONTHLY_REPORT_DAY = 5          # ...on the 5TH — Gateway's final week lands first, so issued-IP numbers are complete
@@ -2217,54 +2215,6 @@ def compute_excel_scores(state):
                     "late": 0, "early": 0, "noshow": 0, "present": 0, "hours": 0.0, "cam": 0.0, "away": 0.0}
     return rows
 
-async def refresh_accountability_board():
-    """Owner-only bird's-eye: ONE live message in #attendance-log, edited in place daily.
-       Per rep: lates / earlies / no-shows / hours / camera% NEXT TO their AP and Excel
-       Score — so weak results and weak attentiveness sit on the same line."""
-    ch = client.get_channel(LOG_CHANNEL_ID)
-    if not ch: return
-    state = await fetch_app_state() if SUPABASE_KEY else None
-    rows = compute_excel_scores(state)
-    if not rows: return
-    order = sorted(rows.items(), key=lambda kv: (kv[1]["late"] + kv[1]["early"] + kv[1]["noshow"],
-                                                 kv[1].get("away", 0), -kv[1]["ap"]), reverse=True)
-    # trend: this week's hours vs last week's, per rep (▲ up ▼ down – flat)
-    cur_w = {a["name"].strip().lower(): a["hours"] for a in aggregate_dates(_week_dates(0)).values()}
-    prev_w = {a["name"].strip().lower(): a["hours"] for a in aggregate_dates(_week_dates(1)).values()}
-    head = f"{'Rep':<13}{'L':>3}{'E':>3}{'NS':>3}{'Hrs':>6}{'T':>2}{'Out':>6}{'Cam':>5}{'AP':>12}{'Sc':>4}"
-    L = [head, "─" * len(head)]
-    for nm, r in order[:25]:
-        campct = (r["cam"] / r["hours"] * 100) if r["hours"] else 0
-        low = nm.strip().lower()
-        tr = _trend_arrow(cur_w.get(low, 0), prev_w.get(low, 0))
-        L.append(f"{nm[:12]:<13}{r['late']:>3}{r['early']:>3}{r['noshow']:>3}"
-                 f"{r['hours']:>6.1f}{tr:>2}{r.get('away', 0):>6.1f}{campct:>4.0f}%"
-                 f"{'$'+format(r['ap'], ',.2f'):>12}{r['pts']:>4}")
-    e = discord.Embed(title=f"📋 Accountability Board — {_month_label(_live_month_key())}",
-        description=("Worst attendance first · results on the same line\n```\n" + "\n".join(L) + "\n```"),
-        color=0xE23B3B)
-    # nickname audit — anyone the data can't match is a silent hole in the stats
-    if state:
-        guild = client.get_guild(GUILD_ID)
-        vrole = guild.get_role(VERIFIED_ROLE_ID) if guild else None
-        if vrole:
-            bad = [mm.display_name for mm in vrole.members
-                   if not mm.bot and mm.id != guild.owner_id
-                   and not match_roster(state, mm.display_name)]
-            if bad:
-                e.add_field(name=f"⚠️ Nickname ≠ roster ({len(bad)}) — their stats can't link up",
-                    value="\n".join("• " + n for n in bad[:12]) + ("\n…" if len(bad) > 12 else ""),
-                    inline=False)
-    e.set_footer(text="Owner + trainers · L=late E=early NS=no-show · Out=hrs out of rooms 9–6 · Sc=Excel Score · daily")
-    async for msg in ch.history(limit=200):   # deep scan — LATE pings bury the board, and a missed find = duplicate board
-        if msg.author == client.user and msg.embeds and (msg.embeds[0].title or "").startswith("📋 Accountability Board"):
-            try: await msg.edit(embed=e)
-            except Exception as ex: print("acct edit", ex)
-            return
-    try: await ch.send(embed=e)
-    except Exception as ex: print("acct send", ex)
-
-
 # ---- Weekly Attendance Matrix (owner + trainers, #attendance-log) ----------
 def _blend(c, a=0.42, bg=CARD_BLACK):
     return tuple(int(c[i] * a + bg[i] * (1 - a)) for i in range(3))
@@ -2359,27 +2309,6 @@ def build_week_people():
     people.sort(key=lambda p: -p["tot_h"])               # most hours in rooms on top
     label = f"{days[0].strftime('%b %-d')} – {days[-1].strftime('%b %-d, %Y')} · Mon–Sat"
     return label, days, people
-
-async def post_weekly_attendance():
-    """Sunday: the detailed week grid — every person, every day, hours + status."""
-    ch = client.get_channel(LOG_CHANNEL_ID)
-    if not ch: return
-    label, days, people = build_week_people()
-    if not people: return
-    buf = render_week_matrix(label, days, people)
-    e = discord.Embed(title=f"🗓️ Weekly Attendance Detail — week of {days[0].strftime('%b %-d')}",
-        description=f"**{len(people)}** tracked · most hours in rooms on top",
-        color=0x3498DB)
-    e.set_footer(text="Owner + trainers · full per-day breakdown")
-    try:
-        if buf:
-            f = discord.File(buf, filename="week.png")
-            e.set_image(url="attachment://week.png")
-            await ch.send(embed=e, file=f)
-        else:
-            await ch.send(embed=e)
-    except Exception as ex: print("week matrix", ex)
-
 
 # ---- rank roles ------------------------------------------------------------
 def find_member(name):
@@ -2946,7 +2875,6 @@ _last_team_ip = None
 _last_monthly = None
 _last_builder = None
 _last_deals_daily = None
-_last_week_matrix = None
 
 @client.event
 async def on_ready():
@@ -2971,8 +2899,6 @@ async def on_ready():
         except Exception as e: print("team board", e)
         try: await refresh_lead_roi_board()
         except Exception as e: print("roi board", e)
-        try: await refresh_accountability_board()
-        except Exception as e: print("acct board", e)
     if not scheduler.is_running(): scheduler.start()
     if not hours_boards_loop.is_running(): hours_boards_loop.start()
     if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
@@ -2991,13 +2917,8 @@ async def scheduler():
     global _last_builder
     if n.weekday() == BUILDER_DAY and n.time() >= BUILDER_CHECK and _last_builder != n.date():
         _last_builder = n.date(); await post_builder_roll()
-    # Saturday 3 PM PT — the weekly attendance grid (full Mon–Sat week is complete)
-    global _last_week_matrix
-    if n.weekday() == WEEK_MATRIX_DAY and n.time() >= WEEK_MATRIX_TIME and _last_week_matrix != n.date():
-        _last_week_matrix = n.date(); await post_weekly_attendance()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await close_out_day()   # silent close: flags -> history, no card posted
-        await refresh_accountability_board()   # owner's bird's-eye board follows the daily close
         await check_sync_sentinel()            # data-pipe health check, once a day
     # 10 PM PT — end-of-day text recap (first in / last out / hours vs expected / cam %)
     global _last_daily_text
