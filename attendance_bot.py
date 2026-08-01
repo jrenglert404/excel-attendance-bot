@@ -972,6 +972,35 @@ def approve_deny_view(uid):
     v.add_item(discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger, custom_id=f"deny_{uid}", emoji="⛔"))
     return v
 
+# ---- #first-90-day-training — schedule reference, posted by the bot ---------
+TRAINING_CH_ID = 1532575093413122238
+
+async def ensure_training_message():
+    ch = client.get_channel(TRAINING_CH_ID)
+    if not ch: return
+    e = discord.Embed(title="🎓 First 90-Day Agent Training",
+        description="All times **Pacific**. If you're in your first 90 days, these are part of your schedule — not extra credit.",
+        color=0xF1C40F)
+    e.add_field(name="📘 Conner White Training — first-90-day agents only",
+        value=("**Mon · Tue · Wed · Fri — 11:30 AM**\n"
+               "**Thu — 8:00 AM**\n"
+               "🔗 **ConnerTheTrainer.com**"), inline=False)
+    e.add_field(name="🏛️ Prime Organization",
+        value=("**Team Meeting — Mon 10:00 AM**\n"
+               "**Workshops — Tue & Thu 10:00 AM**\n"
+               "📞 Zoom: **724-799-3711** · Password: **123-456-78**"), inline=False)
+    e.set_footer(text="Call sessions & huddles run in our Discord voice rooms — see the events at the top of the server.")
+    async for msg in ch.history(limit=10):
+        if msg.author == client.user and msg.embeds:
+            try: await msg.edit(embed=e)
+            except Exception: pass
+            return
+    try:
+        msg = await ch.send(embed=e)
+        try: await msg.pin()
+        except Exception: pass
+    except Exception as ex: print("training msg", ex)
+
 async def send_onboarding_dm(member):
     """One DM the moment a rep is approved — the house rules, identically every time."""
     e = discord.Embed(title="🦁 Welcome to Excel Financial",
@@ -2535,6 +2564,8 @@ async def on_ready():
     try: await tree.sync(guild=discord.Object(GUILD_ID))
     except Exception as e: print("tree sync", e)
     await ensure_commands_message()
+    try: await ensure_training_message()
+    except Exception as e: print("training msg", e)
     if SUPABASE_KEY:
         try: await ensure_lead_roi_message()
         except Exception as e: print("lead roi msg", e)
