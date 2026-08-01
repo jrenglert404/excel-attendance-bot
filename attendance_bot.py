@@ -1781,21 +1781,24 @@ async def refresh_leaders_board():
              if t["spend"] > 0 and str(a).lower() not in IP_EXCLUDE}
     ap = {a: float(v or 0) for a, v in prod.items()
           if float(v or 0) > 0 and str(a).lower() not in IP_EXCLUDE}
-    def crown(d, fmt):
-        if not d: return "_This crown is unclaimed — take it._"
-        nm = max(d, key=d.get)
-        return f"👑 **{nm}** — {fmt(nm, d[nm])}"
+    def podium(d, fmt):
+        """Top 3, medals down the line — 👑 for the leader, then 🥈 🥉."""
+        if not d: return "_This crown is unclaimed — take it._\n​"
+        top3 = sorted(d.items(), key=lambda kv: -kv[1])[:3]
+        medals = ["👑", "🥈", "🥉"]
+        lines = [f"{medals[i]} **{nm}** — {fmt(nm, v)}" for i, (nm, v) in enumerate(top3)]
+        return "\n".join(lines) + "\n​"                 # trailing spacer between categories
     e = discord.Embed(title=f"👑 Leading the Way — {label}",
         description=("Three ways to lead. Pick one and own it — this board updates itself "
-                     "all month, and the crowns move the second someone outworks you."),
+                     "all month, and the crowns move the second someone outworks you.\n​"),
         color=0xD4AF37)
     e.add_field(name="⏱️ THE FLOOR GENERAL — most hours worked",
-        value=crown(hours, lambda n, v: f"**{v:.1f}h** in the rooms"), inline=False)
+        value=podium(hours, lambda n, v: f"**{v:.1f}h** in the rooms"), inline=False)
     e.add_field(name="💸 THE INVESTOR — most spent on leads",
-        value=crown(spend, lambda n, v: f"**${int(round(v)):,}** on leads"
-                    + (f" · {lead_tot[n]['leads']} leads" if n in lead_tot else "")), inline=False)
+        value=podium(spend, lambda n, v: f"**${int(round(v)):,}** on leads"
+                     + (f" · {lead_tot[n]['leads']} leads" if n in lead_tot else "")), inline=False)
     e.add_field(name="💰 THE CLOSER — most business written",
-        value=crown(ap, lambda n, v: f"**${int(round(v)):,} AP** · {len(chips.get(n) or [])} deals"), inline=False)
+        value=podium(ap, lambda n, v: f"**${int(round(v)):,} AP** · {len(chips.get(n) or [])} deals"), inline=False)
     e.set_footer(text="Month-to-date · hours = ALL Discord time · updates automatically · EXCEL FINANCIAL")
     this_title = f"👑 Leading the Way — {label}"
     async for m in ch.history(limit=50):
