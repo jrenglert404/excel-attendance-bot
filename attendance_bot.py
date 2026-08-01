@@ -675,6 +675,49 @@ def build_daily_rows():
     rows.sort(key=lambda r: (r["status"] == "noshow", -r["hours"]))   # most IN on top, no-shows last
     return rows
 
+DAILY_TEXT_TIME = dt.time(22, 0)   # 10 PM PT — end-of-day text recap in #attendance-log
+
+async def post_daily_text_report():
+    """10 PM PT recap — plain text, easiest to digest. One line per person: first entry,
+       final exit, total hours vs expected for the day, camera %. Most hours on top,
+       no-shows at the bottom. By 10 PM the evening grinders are counted too."""
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    if not ch: return
+    ensure_today(); recheck_lates()
+    n = now_pt()
+    target = scheduled_day_hours(n.date())
+    rows = []
+    for rec in today.values():
+        h = live_seconds(rec) / 3600.0
+        cam = camera_pct(rec) * 100
+        first_in = fmt(rec.get("first_join"))
+        last_out = "in room" if rec.get("present") else fmt(rec.get("last_leave"))
+        rows.append((rec["name"], first_in, last_out, h, cam))
+    rows.sort(key=lambda r: -r[3])
+    noshows = []
+    guild = client.get_guild(GUILD_ID)
+    if guild and scheduled_start_today() is not None:
+        role = guild.get_role(VERIFIED_ROLE_ID)
+        if role:
+            noshows = sorted(m.display_name for m in role.members
+                             if not m.bot and str(m.id) not in today)
+    if not rows and not noshows: return
+    head = f"{'Rep':<14}{'In':>9}{'Out':>9}{'Hours':>10}{'Cam':>5}"
+    L = [head, "─" * len(head)]
+    for nm, fi, lo, h, cam in rows:
+        hrs = f"{h:.1f}/{target:g}" if target else f"{h:.1f}h"
+        star = "⭐" if target and h > target else " "
+        L.append(f"{_short_name(nm, 13):<14}{fi:>9}{lo:>9}{hrs:>9}{star}{cam:>4.0f}%")
+    body = "```\n" + "\n".join(L) + "\n```"
+    if noshows:
+        body += f"🚫 **No-shows ({len(noshows)}):** " + ", ".join(noshows)
+    e = discord.Embed(title=f"🌙 Day Recap — {n.strftime('%A, %B %-d')}",
+        description=body, color=0x5865F2)
+    e.set_footer(text="In = first entry · Out = final exit · Hours = ALL Discord time vs scheduled "
+                      "(⭐ over) · Cam = % of floor time on camera · most hours on top")
+    try: await ch.send(embed=e)
+    except Exception as ex: print("daily text", ex)
+
 async def close_out_day():
     """6 PM close: judge the day (late/early/away/no-shows) into history and flag repeat
        offenders — but post NO daily card. The live #hours boards + /attendance day:...
@@ -1176,6 +1219,7 @@ async def wins_poller():
         await check_milestones()
         await check_streaks(new_agents)
         await refresh_team_ap_board()   # live team-production board follows new deals
+        await refresh_lead_roi_board()  # ROI board moves with every submitted deal
 
 async def check_milestones():
     rec = client.get_channel(RECOGNITION_CH_ID)
@@ -1518,6 +1562,8 @@ class LeadOrderModal(discord.ui.Modal, title="Log a Lead Order"):
             f"✅ Logged **{qty} {ltype} leads** from **{vendor}** — **${int(round(price)):,}**.\n"
             f"📊 **{canon}** month-to-date: **${int(round(mine['spend'])):,}** · **{mine['orders']} orders** · **{mine['leads']} leads**.\n"
             f"Only monthly totals are public — your individual orders stay private.")
+        try: await refresh_lead_roi_board()             # board moves the moment an order lands
+        except Exception as ex: print("roi after order", ex)
 
 def lead_button():
     v = discord.ui.View(timeout=None)
@@ -1541,50 +1587,125 @@ async def ensure_lead_roi_message():
             return
     await ch.send(embed=e, view=lead_button())
 
-async def post_lead_roi():
+def _short_name(full, width=12):
+    parts = str(full).split()
+    nm = parts[0] if len(parts) == 1 else f"{parts[0]} {parts[-1][0]}."
+    return nm[:width]
+
+def render_roi_card(rows, month_label, team_line):
+    """Branded black & gold ROI card — FULL names, wide columns, zero squinting.
+       rows come pre-sorted: spenders by ROI, then writers w/o spend, then zeros."""
+    if not HAVE_PIL or not rows: return None
+    W, row_h, top = 1150, 58, 210
+    H = top + len(rows) * row_h + 92
+    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
+    tx = 44
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo = Image.open(LOGO_FILE).convert("RGBA").resize((96, 96), Image.LANCZOS)
+            img.paste(logo, (40, 34), logo); tx = 158
+        except Exception: pass
+    d.text((tx, 44), "LEAD ROI", font=_card_font(40, True), fill=CARD_GOLD)
+    d.text((tx, 98), f"{month_label} · return on lead spend · live all month",
+           font=_card_font(21), fill=CARD_WHITE)
+    # column headers — right-aligned over their columns
+    XS = {"spend": 700, "leads": 820, "ap": 980, "roi": 1105}
+    hf = _card_font(18, True)
+    for key, lab in (("spend", "SPEND"), ("leads", "LEADS"), ("ap", "AP"), ("roi", "ROI")):
+        w = d.textlength(lab, font=hf)
+        d.text((XS[key] - w, top - 34), lab, font=hf, fill=CARD_DIM)
+    d.line([36, top - 8, W - 36, top - 8], fill=CARD_GOLD, width=2)
+    nf, vf = _card_font(24, True), _card_font(22)
+    rf = _card_font(23, True)
+    y = top + 6
+    for i, r in enumerate(rows, 1):
+        if i % 2 == 0:                                     # subtle zebra striping
+            d.rectangle([28, y - 6, W - 28, y + row_h - 14], fill=(22, 22, 27))
+        rank_col = CARD_GOLD if i <= 3 else CARD_DIM
+        d.text((44, y + 2), f"{i}", font=_card_font(22, True), fill=rank_col)
+        d.text((92, y), str(r["a"]), font=nf, fill=CARD_WHITE)     # FULL name
+        vals = [("spend", _kfmt(r["sp"]) if r["sp"] > 0 else "—", CARD_WHITE if r["sp"] > 0 else CARD_DIM, vf),
+                ("leads", str(r["leads"]) if r["leads"] > 0 else "—", CARD_WHITE if r["leads"] > 0 else CARD_DIM, vf),
+                ("ap", _kfmt(r["ap"]) if r["ap"] > 0 else "—", CARD_WHITE if r["ap"] > 0 else CARD_DIM, vf)]
+        for key, txt, col, fnt in vals:
+            w = d.textlength(txt, font=fnt)
+            d.text((XS[key] - w, y + 2), txt, font=fnt, fill=col)
+        if r["roi"] is not None:
+            rtxt = f"{r['roi']:.1f}x"
+            rcol = CARD_GOLD if r["roi"] >= 1 else (231, 76, 60)   # under 1x = red flag
+        else:
+            rtxt, rcol = "—", CARD_DIM
+        w = d.textlength(rtxt, font=rf)
+        d.text((XS["roi"] - w, y + 1), rtxt, font=rf, fill=rcol)
+        d.line([36, y + row_h - 12, W - 36, y + row_h - 12], fill=CARD_LINE, width=1)
+        y += row_h
+    d.text((44, H - 58), team_line + "  ·  EXCEL FINANCIAL", font=_card_font(19), fill=CARD_DIM)
+    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
+    return buf
+
+async def refresh_lead_roi_board():
+    """LIVE Lead ROI board — ONE message edited in place all month, like the production
+       board. Every active roster rep: submitted AP (GroupMe -> tracker -> here) vs lead
+       spend (private order form) with the ROI ratio. When the month flips, the old
+       board freezes as a record and a fresh one starts."""
     if not SUPABASE_KEY: return
     ch = client.get_channel(LEAD_ROI_CH_ID)
     if not ch: return
     state = await fetch_app_state()
     if not state: return
-    month = _live_month_key(); label = _month_label(month)
-    totals = _agent_lead_totals(await fetch_lead_purchases(month))
-    spenders = {a: t for a, t in totals.items() if t["spend"] > 0}
-    if not spenders: return                            # nobody logged yet — no empty board
-    mstart = now_pt().replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc).isoformat()
-    try: deals = await fetch_deals_since(mstart)
-    except Exception as e: print("lead roi deals", e); deals = []
-    byap = summarize_deals(deals)["by"]                # {agent:{deals,apps,ap}}
-    ipmap = _net_map(state, month)                     # {agent: issued IP}
+    mkey = _live_month_key(); label = _month_label(mkey)
+    prod = _submitted_ap_by_agent(state, mkey)                       # canonical tracker names
+    totals = _agent_lead_totals(await fetch_lead_purchases(mkey))
+    roster = [str(a) for a in (state.get("roster") or []) if str(a).lower() not in IP_EXCLUDE]
+    if not roster: return
     rows = []
-    for agent, t in spenders.items():
-        if str(agent).lower() in IP_EXCLUDE: continue
-        spend = t["spend"]; ap = byap.get(agent, {}).get("ap", 0.0); ipv = ipmap.get(agent, 0.0)
-        rows.append({"a": agent, "spend": spend, "ap": ap, "ip": ipv,
-                     "apx": (ap / spend) if spend else 0.0, "ipx": (ipv / spend) if spend else 0.0})
-    if not rows: return
-    rows.sort(key=lambda r: r["ap"], reverse=True)     # RESULTS first — biggest writers lead
-    head = f"{'#':<2}{'Rep':<13}{'Spend':>7}{'AP':>8}{'IP':>8}{'AP×':>6}{'IP×':>6}"
-    lines = [head, "─" * len(head)]
-    for i, r in enumerate(rows, 1):
-        nm = r["a"].split()[0][:12]
-        lines.append(f"{i:<2}{nm:<13}{_kfmt(r['spend']):>7}{_kfmt(r['ap']):>8}{_kfmt(r['ip']):>8}"
-                     f"{r['apx']:>5.1f}x{r['ipx']:>5.1f}x")
-    table = "```\n" + "\n".join(lines) + "\n```"
-    e = discord.Embed(title=f"💸 Lead ROI Scoreboard — {label}",
-        description=f"Month-to-date · ranked by AP written · **{len(rows)}** reps reporting\n{table}",
+    for a in roster:
+        ap = float(prod.get(a, 0) or 0)
+        t = totals.get(a) or {}
+        sp = float(t.get("spend", 0) or 0); leads = int(t.get("leads", 0) or 0)
+        rows.append({"a": a, "ap": ap, "sp": sp, "leads": leads,
+                     "roi": (ap / sp) if sp > 0 else None})
+    # spenders ranked by ROI first (it's an ROI board), then writers with no spend
+    # logged, then everyone else — the zeros stay visible at the bottom on purpose.
+    rows.sort(key=lambda r: (0 if r["sp"] > 0 else (1 if r["ap"] > 0 else 2),
+                             -(r["roi"] or 0), -r["ap"], r["a"]))
+    spenders = [r for r in rows if r["sp"] > 0]
+    tot_sp = sum(r["sp"] for r in spenders); tot_ap = sum(r["ap"] for r in spenders)
+    team_line = (f"{len(spenders)} reps investing · ${int(round(tot_sp)):,} in leads → "
+                 f"${int(round(tot_ap)):,} AP · {(tot_ap / tot_sp):.1f}x team ROI"
+                 if tot_sp > 0 else "No lead orders logged yet this month")
+    summary = (f"**{len(spenders)}** reps investing · **${int(round(tot_sp)):,}** in leads → "
+               f"**${int(round(tot_ap)):,}** AP (**{(tot_ap / tot_sp):.1f}x** team ROI)"
+               if tot_sp > 0 else "_No lead orders logged yet this month — hit the button above._")
+    e = discord.Embed(title=f"💸 Lead ROI — {label}",
+        description=f"Live all month · ranked by **return on lead spend**\n{summary}",
         color=0x1ABC9C)
-    by_spend = sorted(rows, key=lambda r: r["spend"], reverse=True)
-    top = by_spend[:3]
-    team_ap = sum(r["ap"] for r in rows) or 1.0
-    top_ap = sum(r["ap"] for r in top)
-    e.add_field(name="💡 Spending works",
-        value=(f"Your top {len(top)} lead investors wrote **${int(round(top_ap)):,}** — "
-               f"**{top_ap/team_ap*100:.0f}%** of this board's AP. The reps who spend the most write the most."),
-        inline=False)
-    e.set_footer(text="Excel Financial · AP = submitted (live) · IP = issued from Gateway · totals only")
-    try: await ch.send(embed=e)
-    except Exception as ex: print("lead roi send", ex)
+    e.set_footer(text="AP = submitted production (GroupMe → tracker) · Spend = logged lead orders · "
+                      "— = no orders logged · updates automatically")
+    buf = render_roi_card(rows[:24], label, team_line)
+    f = None
+    if buf:
+        f = discord.File(buf, filename="roi.png")
+        e.set_image(url="attachment://roi.png")
+    else:                                              # Pillow missing — text fallback, full names
+        head = f"{'#':<3}{'Rep':<21}{'Spend':>7}{'Leads':>6}{'AP':>9}{'ROI':>7}"
+        L = [head, "─" * len(head)]
+        for i, r in enumerate(rows[:30], 1):
+            roi = f"{r['roi']:.1f}x" if r["roi"] is not None else "—"
+            L.append(f"{i:<3}{str(r['a'])[:20]:<21}{_kfmt(r['sp']):>7}{r['leads']:>6}"
+                     f"{_kfmt(r['ap']):>9}{roi:>7}")
+        e.description += "\n```\n" + "\n".join(L) + "\n```"
+    this_title = f"💸 Lead ROI — {label}"
+    async for m in ch.history(limit=50):
+        if m.author == client.user and m.embeds and (m.embeds[0].title or "") == this_title:
+            try:
+                await m.edit(embed=e, attachments=[f] if f else [])
+            except Exception as ex: print("roi edit", ex)
+            return
+    try:
+        await ch.send(embed=e, file=f) if f else await ch.send(embed=e)
+    except Exception as ex: print("roi send", ex)
 
 async def post_lead_report():
     """Owner-only breakdown of WHAT the team is buying — by lead type and by vendor."""
@@ -2680,6 +2801,7 @@ async def post_ntg_report():
 
 # ---- scheduler ------------------------------------------------------------
 _last_daily = None
+_last_daily_text = None
 _last_weekly = None
 _last_team_ip = None
 _last_monthly = None
@@ -2708,6 +2830,8 @@ async def on_ready():
         except Exception as e: print("lead roi msg", e)
         try: await refresh_team_ap_board()
         except Exception as e: print("team board", e)
+        try: await refresh_lead_roi_board()
+        except Exception as e: print("roi board", e)
         try: await refresh_accountability_board()
         except Exception as e: print("acct board", e)
     if not scheduler.is_running(): scheduler.start()
@@ -2736,6 +2860,10 @@ async def scheduler():
         _last_daily = n.date(); await close_out_day()   # silent close: flags -> history, no card posted
         await refresh_accountability_board()   # owner's bird's-eye board follows the daily close
         await check_sync_sentinel()            # data-pipe health check, once a day
+    # 10 PM PT — end-of-day text recap (first in / last out / hours vs expected / cam %)
+    global _last_daily_text
+    if n.time() >= DAILY_TEXT_TIME and _last_daily_text != n.date() and scheduled_start_today() is not None:
+        _last_daily_text = n.date(); await post_daily_text_report()
     # 9 PM PT — daily deals total in #deals (late closes counted)
     global _last_deals_daily
     if n.time() >= DEALS_DAILY_TIME and _last_deals_daily != n.date() and scheduled_start_today() is not None:
@@ -2746,7 +2874,7 @@ async def scheduler():
         await post_sunday_wrap()       # ONE public wrap + private accountability + roles
         await send_report_cards()      # every rep's private DM report card
         await post_quadrant()          # hours-vs-production quadrant (owner + trainers)
-        await post_lead_roi()          # weekly lead-spend ROI scoreboard (public)
+        await refresh_lead_roi_board() # keep the live ROI board fresh
         await post_lead_report()       # lead-buying breakdown (owner-only)
         await refresh_team_ap_board()  # keep the live manager board fresh
     # IP Reports are import-driven (see ip_poller) — no fixed weekly/monthly schedule.
