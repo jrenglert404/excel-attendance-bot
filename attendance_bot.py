@@ -144,10 +144,9 @@ TEAM_CH_ID = 1531861880824402000           # #team-production
 HOURS_CH_ID = 1533183714371305593          # #hours — live day/week/month hour boards (read-only)
 
 # --- Rank roles: auto-awarded at the Sunday Wrap (and Top IP on the Final MTD drop) ---
-ROLE_CLOSER  = 1531874671220494416   # 💰 Closer of the Week
-ROLE_GRINDER = 1531874672176664638   # ⏱️ Grinder of the Week
-ROLE_MANAGER = 1531874673237954753   # 👔 Top Manager
-ROLE_TOP_IP  = 1531874674215227503   # 📈 Top IP
+ROLE_CLOSER   = 1531874671220494416   # 💰 The Closer — most business written (auto-synced to the crown board)
+ROLE_FLOOR    = 1531874672176664638   # ⏱️ Floor General — most hours worked (auto-synced)
+ROLE_INVESTOR = 1531874673237954753   # 💸 The Investor — most spent on leads (auto-synced)
 
 # --- Slash commands live in #commands (instructions auto-posted there) ---
 COMMANDS_CH_ID = 1531874676257591537
@@ -909,7 +908,7 @@ async def post_sunday_wrap():
         if warm:
             e.add_field(name="🪑 On the clock, no deals yet",
                 value="\n".join("• " + n for n in warm[:10]), inline=False)
-        e.set_footer(text="Excel Financial · hours exclude AFK · roles refreshed weekly")
+        e.set_footer(text="Excel Financial · hours exclude AFK · crowns live in #recognition")
         card_rows = sorted(ds["by"].items(), key=lambda kv: kv[1]["ap"], reverse=True)[:5]
         card_rows = [(nm2, f"${int(s['ap']):,} · {s['deals']}d") for nm2, s in card_rows]
         if card_rows:
@@ -918,26 +917,6 @@ async def post_sunday_wrap():
         else:
             try: await rec.send(embed=e)
             except Exception as ex: print("recognition", ex)
-
-    # ---- weekly rank roles ----
-    try:
-        top_closer = max(ds["by"].items(), key=lambda kv: kv[1]["ap"])[0] if ds["by"] else None
-        top_hours = max(rows, key=lambda r: r["hours"])["name"] if rows else None
-        top_mgr = None
-        if SUPABASE_KEY:
-            state = await fetch_app_state()
-            if state:
-                prod = _submitted_ap_by_agent(state, _live_month_key())
-                team = _team_rollup(state, prod)
-                mgrs = [(mgr, team.get(mgr, 0)) for mgr in _managers(state)
-                        if str(mgr).lower() not in IP_EXCLUDE
-                        and (team.get(mgr, 0) - float(prod.get(mgr, 0) or 0)) > 0]
-                if mgrs: top_mgr = max(mgrs, key=lambda kv: kv[1])[0]
-        await award_role(ROLE_CLOSER, top_closer)
-        await award_role(ROLE_GRINDER, top_hours)
-        await award_role(ROLE_MANAGER, top_mgr)
-    except Exception as ex:
-        print("rank roles", ex)
 
     priv = client.get_channel(LOG_CHANNEL_ID)
     if priv:
@@ -1434,9 +1413,6 @@ async def post_ip_report():
         e.add_field(name=field, value=board, inline=False)
         try: await ch.send(embed=e)
         except Exception as ex: print("ip report send", ex)
-    if rpt.get("final") and nm:                     # 📈 Top IP rank role follows the Final MTD
-        try: await award_role(ROLE_TOP_IP, max(nm.items(), key=lambda kv: kv[1])[0])
-        except Exception as ex: print("top ip role", ex)
 
 @tasks.loop(minutes=5)
 async def ip_poller():
@@ -1797,7 +1773,13 @@ async def refresh_leaders_board():
                      + (f" · {lead_tot[n]['leads']} leads" if n in lead_tot else "")), inline=False)
     e.add_field(name="💰 THE CLOSER — most business written",
         value=podium(ap, lambda n, v: f"**${int(round(v)):,} AP** · {len(chips.get(n) or [])} deals"), inline=False)
-    e.set_footer(text="Month-to-date · hours = ALL Discord time · updates automatically · EXCEL FINANCIAL")
+    e.set_footer(text="Month-to-date · hours = ALL Discord time · crowns = live Discord roles · EXCEL FINANCIAL")
+    # the crowns ARE the roles — nobody manages them, they follow the board
+    try:
+        await award_role(ROLE_FLOOR,    max(hours, key=hours.get) if hours else None)
+        await award_role(ROLE_INVESTOR, max(spend, key=spend.get) if spend else None)
+        await award_role(ROLE_CLOSER,   max(ap,    key=ap.get)    if ap    else None)
+    except Exception as ex: print("crown sync", ex)
     this_title = f"👑 Leading the Way — {label}"
     async for m in ch.history(limit=50):
         if m.author == client.user and m.embeds and (m.embeds[0].title or "") == this_title:
@@ -2324,17 +2306,18 @@ def find_member(name):
     return hits[0] if len(hits) == 1 else None
 
 async def award_role(role_id, winner_name):
-    """Move a weekly rank role to its new holder (clears previous holders)."""
+    """Move a crown role to its rightful holder (clears everyone else). Idempotent —
+       zero API calls when the holder is unchanged, so it is safe on a fast loop."""
     guild = client.get_guild(GUILD_ID)
     role = guild.get_role(role_id) if guild else None
     if not role: return
     winner = find_member(winner_name) if winner_name else None
     for m in list(role.members):
         if m != winner:
-            try: await m.remove_roles(role, reason="weekly rank rotation")
+            try: await m.remove_roles(role, reason="crown changed hands")
             except Exception as e: print("role rm", e)
     if winner and role not in winner.roles:
-        try: await winner.add_roles(role, reason="weekly rank award")
+        try: await winner.add_roles(role, reason="crown earned")
         except Exception as e: print("role add", e)
 
 
