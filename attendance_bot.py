@@ -1994,12 +1994,16 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_m
         tv = team.get(mgr, 0.0)
         if (tv - own) <= 0: continue                   # no producing downline -> off the manager board
         mrows.append((mgr, tv, int(team_apps.get(mgr, 0))))
-    mrows.sort(key=lambda r: r[1], reverse=True)
-    mrows = mrows[:10]
-    # --- Producer Scoreboard: top 10 by personal production (owner INCLUDED here) ---
+    mrows.sort(key=lambda r: r[1], reverse=True)          # EVERY producing manager — no cap
+    # --- Producer Scoreboard: the ENTIRE team (owner included), zeros visible at the bottom ---
     irows = [(a, float(v or 0), int(apps_map.get(a, 0))) for a, v in prod.items() if float(v or 0) > 0]
-    irows.sort(key=lambda r: r[1], reverse=True)
-    irows = irows[:10]
+    have = {a for a, _v, _n in irows}
+    for a in (state.get("roster") or []):                 # roster members with nothing yet still show
+        a = str(a)
+        if a not in have and str(a).lower() not in IP_EXCLUDE:
+            irows.append((a, 0.0, int(apps_map.get(a, 0) or 0)))
+    irows.sort(key=lambda r: (-r[1], r[0]))
+    irows = irows[:35]                                    # embed size guard — roster is well under this
     if not mrows and not irows: return None
     blocks = []
     # --- Excel Financial monthly total across the whole floor ---
@@ -2031,17 +2035,23 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_m
     else:
         title = f"🏆 Team Production — {month_label}"; color = 0xF1C40F
     e = discord.Embed(title=title, description="\n".join(blocks), color=color)
-    e.set_footer(text="Manager = whole team rolled up (needs downline production) · Producer = personal · top 10")
+    e.set_footer(text="Manager = whole team rolled up (needs downline production) · Producer = personal · FULL team, zeros included")
     return e
 
-async def refresh_team_ap_board():
-    """Live manager board on SUBMITTED AP — edited in place as deals come in all month."""
+def _prev_month_key():
+    n = now_pt()
+    y, m = (n.year - 1, 12) if n.month == 1 else (n.year, n.month - 1)
+    return f"{y:04d}-{m:02d}"
+
+async def refresh_team_ap_board(mkey=None):
+    """Live manager board on SUBMITTED AP — edited in place as deals come in all month.
+       Pass a month key to (re)render a specific month's board (e.g. last month's)."""
     if not SUPABASE_KEY: return
     ch = client.get_channel(TEAM_CH_ID)
     if not ch: return
     state = await fetch_app_state()
     if not state: return
-    mkey = _live_month_key(); label = _month_label(mkey)
+    mkey = mkey or _live_month_key(); label = _month_label(mkey)
     prod = _submitted_ap_by_agent(state, mkey)   # canonical names from the tracker -> matches it exactly
     mdeals = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
     deal_count = sum(len(chips or []) for chips in mdeals.values())
@@ -2895,8 +2905,11 @@ async def on_ready():
     if SUPABASE_KEY:
         try: await ensure_lead_roi_message()
         except Exception as e: print("lead roi msg", e)
-        try: await refresh_team_ap_board()
+        try: await refresh_team_ap_board()              # current month exists from day 1
         except Exception as e: print("team board", e)
+        if now_pt().day <= 7:                            # early in a month: last month's board
+            try: await refresh_team_ap_board(_prev_month_key())   # re-renders with the FULL team
+            except Exception as e: print("prev team board", e)
         try: await refresh_lead_roi_board()
         except Exception as e: print("roi board", e)
     if not scheduler.is_running(): scheduler.start()
