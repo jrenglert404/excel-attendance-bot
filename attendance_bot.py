@@ -43,6 +43,7 @@ Python 3.9+, discord.py 2.3+.  Set DISCORD_TOKEN in the environment.
 
 import os
 import io
+import re
 import json
 import asyncio
 import datetime as dt
@@ -141,6 +142,7 @@ LEAD_TABLE        = "lead_purchases"       # Supabase append-only log (see setup
 #     (uplines come from your tracker). Submitted-AP board auto-updates live all month;
 #     issued-IP team board posts at month end. ---
 TEAM_CH_ID = 1531861880824402000           # #team-production
+HOURS_CH_ID = 1533183714371305593          # #hours — live day/week/month hour boards (read-only)
 
 # --- Rank roles: auto-awarded at the Sunday Wrap (and Top IP on the Final MTD drop) ---
 ROLE_CLOSER  = 1531874671220494416   # 💰 Closer of the Week
@@ -349,10 +351,44 @@ def camera_pct(rec):
     s = live_seconds(rec)
     return (live_camera(rec) / s) if s > 0 else 0.0
 
+def _freeze_day(day_iso, records):
+    """Write a finished day's FINAL numbers into history at midnight rollover, so
+       hours worked after the 6 PM close (or on unscheduled days) are never lost.
+       Flags (late/early/away/no-show) judged at the 6 PM snapshot are preserved —
+       only the hour totals grow."""
+    try: wd = dt.date.fromisoformat(day_iso).weekday()
+    except Exception: return
+    sched = SCHEDULE.get(wd) is not None
+    hist = load_json(HISTORY_FILE, {})
+    prev = hist.get(day_iso) or {}
+    snap = dict(prev)                                     # keep no-shows & anyone already snapped
+    for mid, rec in records.items():
+        base = prev.get(mid) or {}
+        snap[mid] = {"name": rec["name"],
+                     "seconds": live_seconds(rec),        # full 24/7 total for the day
+                     "camera_seconds": live_camera(rec),
+                     "late": base.get("late", bool(rec.get("late")) if sched else False),
+                     "left_early": base.get("left_early", False),
+                     "no_show": base.get("no_show", False),
+                     "away_seconds": base.get("away_seconds", 0)}
+    hist[day_iso] = snap; save_json(HISTORY_FILE, hist)
+
 def ensure_today():
     global today, current_day
     if current_day != today_key():
-        current_day = today_key(); today = {}; save_state()
+        old_day, old = current_day, today
+        current_day = today_key(); today = {}
+        if old_day and old:
+            _freeze_day(old_day, old)                     # finished day -> history, in full
+            ts = now_pt().isoformat()                     # carry over anyone in a room at midnight
+            for mid, rec in old.items():
+                if rec.get("present") and rec.get("enter_ts"):
+                    today[mid] = {"name": rec["name"], "first_join": ts, "last_leave": None,
+                                  "enter_ts": ts, "total_seconds": 0.0, "present": True,
+                                  "late": False, "camera_on": bool(rec.get("camera_on")),
+                                  "cam_ts": ts if rec.get("camera_on") else None,
+                                  "camera_seconds": 0.0}
+        save_state()
 
 def is_early_leave(rec):
     if rec["present"]: return False
@@ -546,7 +582,9 @@ def trailing_counts(days=7):
     hist = load_json(HISTORY_FILE, {}); end = now_pt().date(); counts = {}
     today_iso = end.isoformat()
     for i in range(days):
-        for mid, r in hist.get((end - dt.timedelta(days=i)).isoformat(), {}).items():
+        day_iso = (end - dt.timedelta(days=i)).isoformat()
+        if day_iso == today_iso: continue              # today comes from live clocks below
+        for mid, r in hist.get(day_iso, {}).items():
             c = counts.setdefault(mid, {"name": r["name"], "late": 0, "early": 0, "away": 0.0, "hours": 0.0})
             c["name"] = r["name"]
             if r.get("late"): c["late"] += 1
@@ -554,7 +592,6 @@ def trailing_counts(days=7):
             if not r.get("no_show"): c["away"] += r.get("away_seconds", 0) / 3600.0
             c["hours"] += r.get("seconds", 0) / 3600.0
     for mid, rec in today.items():
-        if today_iso in hist: break                    # today already snapshotted — don't double-count
         c = counts.setdefault(mid, {"name": rec["name"], "late": 0, "early": 0, "away": 0.0, "hours": 0.0})
         if rec["late"]: c["late"] += 1
         if is_early_leave(rec): c["early"] += 1
@@ -637,34 +674,16 @@ def build_daily_rows():
     rows.sort(key=lambda r: (r["status"] == "noshow", -r["hours"]))   # most IN on top, no-shows last
     return rows
 
-async def post_daily_report():
-    ch = client.get_channel(LOG_CHANNEL_ID); start = scheduled_start_today()
-    if not ch or start is None: return
-    end_t = end_today() or dt.time(18, 0)
-    rows = build_daily_rows()
-    if not rows: return
-    day_label = now_pt().strftime("%A, %B %-d")
-    buf = render_daily_card(day_label, start.strftime("%-I:%M %p"), end_t.strftime("%-I:%M %p"), rows)
-    problems = sum(1 for r in rows if r["status"] != "ontime")
-    e = discord.Embed(title=f"📋 Attendance — {day_label}",
-        description=(f"**{len(rows) - problems}/{len(rows)}** clean · **{problems}** flagged · "
-                     "most hours in rooms on top"),
-        color=0xE23B3B if problems else 0x2ECC71)
-    e.set_footer(text="Private · Pacific · AFK not counted")
-    try:
-        if buf:
-            f = discord.File(buf, filename="daily.png")
-            e.set_image(url="attachment://daily.png")
-            await ch.send(embed=e, file=f)
-        else:                                            # Pillow missing — text fallback
-            for r in rows[:25]:
-                e.add_field(name=r["name"],
-                            value=f"{DAILY_STATUS_LABEL.get(r['status'],'')} {r.get('detail','')} · {r['hours']:.1f}h",
-                            inline=False)
-            await ch.send(embed=e)
-    except Exception as ex: print("daily", ex)
+async def close_out_day():
+    """6 PM close: judge the day (late/early/away/no-shows) into history and flag repeat
+       offenders — but post NO daily card. The live #hours boards + /attendance day:...
+       lookup replaced the scheduled report."""
+    if scheduled_start_today() is None: return
+    recheck_lates()
     snapshot_today()
-    await post_autoflags(ch, guild)
+    ch = client.get_channel(LOG_CHANNEL_ID)
+    guild = client.get_guild(GUILD_ID)
+    if ch: await post_autoflags(ch, guild)
 
 async def post_autoflags(ch, guild):
     counts = trailing_counts(7)
@@ -695,7 +714,7 @@ def aggregate_dates(dates):
     hist = load_json(HISTORY_FILE, {}); agg = {}
     for day in dates:
         iso = day.isoformat(); snap = hist.get(iso)
-        if not snap: continue
+        if not snap or iso == today_key(): continue       # today comes from live clocks, never hist
         scheduled = SCHEDULE.get(day.weekday()) is not None
         for mid, r in snap.items():
             a = agg.setdefault(mid, {"name": r["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
@@ -724,10 +743,10 @@ def _trend_arrow(cur, prev, tol=0.1):
     if cur < prev * (1 - tol): return "▼"
     return "–"
 
-def _merge_live_today(agg, hist):
-    """Fold TODAY'S live clocks into an aggregate — mid-day stats were blind to the
-       current session until the 6 PM snapshot, which made /mystats read 'no floor time'."""
-    if today_key() in hist: return agg                    # already snapshotted — don't double-count
+def _merge_live_today(agg, hist=None):
+    """Fold TODAY'S live clocks into an aggregate. The aggregates skip today's history
+       snapshot entirely (see aggregate_*), so live is always the source of truth for
+       the current day — stats keep climbing after the 6 PM close instead of freezing."""
     scheduled = scheduled_start_today() is not None
     for mid, rec in today.items():
         a = agg.setdefault(mid, {"name": rec["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
@@ -745,7 +764,7 @@ def aggregate_week():
     hist = load_json(HISTORY_FILE, {}); end = now_pt().date(); agg = {}
     for i in range(7):
         day = (end - dt.timedelta(days=i)).isoformat(); snap = hist.get(day)
-        if not snap: continue
+        if not snap or day == today_key(): continue       # today comes from live clocks
         scheduled = SCHEDULE.get(dt.date.fromisoformat(day).weekday()) is not None
         for mid, r in snap.items():
             a = agg.setdefault(mid, {"name": r["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
@@ -767,7 +786,7 @@ def aggregate_month():
     hist = load_json(HISTORY_FILE, {}); end = now_pt().date(); agg = {}
     for i in range(end.day):
         day = (end - dt.timedelta(days=i)).isoformat(); snap = hist.get(day)
-        if not snap: continue
+        if not snap or day == today_key(): continue       # today comes from live clocks
         scheduled = SCHEDULE.get(dt.date.fromisoformat(day).weekday()) is not None
         for mid, r in snap.items():
             a = agg.setdefault(mid, {"name": r["name"], "hours": 0.0, "cam": 0.0, "scheduled": 0,
@@ -1798,6 +1817,82 @@ async def refresh_team_ap_board():
     try: await ch.send(embed=e)
     except Exception as ex: print("team send", ex)
 
+# ---- live hour boards (#hours) ---------------------------------------------
+# Three posts the bot edits forever: TODAY / THIS WEEK / THIS MONTH. Total Discord
+# voice time (AFK excluded), counted 24/7 — not just the 9–6 window. Late/early/out
+# flags stay schedule-based elsewhere; these boards are pure hours.
+HOURS_BOARD_TITLES = {"day": "🕐 Hours — Today", "week": "🗓️ Hours — This Week",
+                      "month": "📆 Hours — This Month"}
+
+def _hours_totals(dates):
+    """[(name, hours)] across dates — history for finished days, live clocks for today."""
+    hist = load_json(HISTORY_FILE, {})
+    tk = today_key(); tot = {}
+    want_today = False
+    for d in dates:
+        iso = d.isoformat()
+        if iso == tk: want_today = True; continue
+        for r in (hist.get(iso) or {}).values():
+            if r.get("seconds", 0) > 0:
+                tot[r["name"]] = tot.get(r["name"], 0.0) + r["seconds"] / 3600.0
+    if want_today:
+        for rec in today.values():
+            s = live_seconds(rec)
+            if s > 0: tot[rec["name"]] = tot.get(rec["name"], 0.0) + s / 3600.0
+    return sorted(tot.items(), key=lambda kv: (-kv[1], kv[0]))
+
+def _hours_board_embed(kind):
+    n = now_pt(); tdy = n.date()
+    if kind == "day":
+        dates = [tdy]; sub = n.strftime("%A, %B %-d")
+    elif kind == "week":
+        monday = tdy - dt.timedelta(days=tdy.weekday())
+        dates = [monday + dt.timedelta(days=i) for i in range(7)]   # Mon–Sun, 24/7 hours
+        sub = f"{monday.strftime('%b %-d')} – {(monday + dt.timedelta(days=6)).strftime('%b %-d')}"
+    else:
+        first = tdy.replace(day=1)
+        nxt = dt.date(first.year + (first.month == 12), (first.month % 12) + 1, 1)
+        dates = [first + dt.timedelta(days=i) for i in range((nxt - first).days)]
+        sub = n.strftime("%B %Y")
+    rows = _hours_totals(dates)
+    top = rows[0][1] if rows else 0.0
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (nm, h) in enumerate(rows[:40]):
+        tag = medals[i] if i < 3 else f"`{i + 1:>2}.`"
+        lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**")
+    body = f"*{sub}*\n\n" + ("\n".join(lines) if lines else "_No hours on the board yet._")
+    e = discord.Embed(title=HOURS_BOARD_TITLES[kind], description=body, color=0xD4AF37)
+    e.set_footer(text=f"ALL Discord voice time · AFK not counted · auto-updates · {n.strftime('%-I:%M %p')} PT")
+    return e
+
+async def refresh_hours_boards():
+    ch = client.get_channel(HOURS_CH_ID)
+    if not ch: return
+    ensure_today()
+    want = {HOURS_BOARD_TITLES[k]: _hours_board_embed(k) for k in ("day", "week", "month")}
+    found = set()
+    async for m in ch.history(limit=25):
+        if m.author == client.user and m.embeds:
+            t = m.embeds[0].title or ""
+            if t in want and t not in found:
+                found.add(t)
+                try: await m.edit(embed=want[t])
+                except Exception as ex: print("hours edit", ex)
+    for k in ("day", "week", "month"):                     # first boot: post in order + pin
+        t = HOURS_BOARD_TITLES[k]
+        if t not in found:
+            try:
+                msg = await ch.send(embed=want[t])
+                try: await msg.pin()
+                except Exception: pass
+            except Exception as ex: print("hours send", ex)
+
+@tasks.loop(seconds=240)
+async def hours_boards_loop():
+    try: await refresh_hours_boards()
+    except Exception as ex: print("hours boards", ex)
+
 async def post_team_ip_monthly():
     """End-of-month manager board on ISSUED IP (a fresh post, not an edit)."""
     if not SUPABASE_KEY: return
@@ -2048,7 +2143,9 @@ async def ensure_commands_message():
         description=(
             "Type `/` in any channel and pick a command. **Answers are private — only you see them.**\n\n"
             "**/mystats** — your week: hours, camera %, lates · your month: deals, AP, **progress toward your goal & commit**, lead spend vs lead commit & ROI\n"
-            "**/attendance** — *(owner & trainers only)* today / week / month / hours-vs-production views\n\n"
+            "**/attendance** — *(owner & trainers only)* today / week / month / hours-vs-production — or add "
+            "`day:7/30` to pull any specific day\n\n"
+            "**Live hour boards** → <#" + str(HOURS_CH_ID) + "> — today / week / month, all Discord time, always current.\n"
             "Leaderboards live in <#" + str(TEAM_CH_ID) + "> — updated live, all month.\n"
             "**Logging lead orders** → hit the button in <#" + str(LEAD_ROI_CH_ID) + "> every time you buy.\n"
             "*Tip: keep your server nickname set to your real name so the bot can match your production.*"),
@@ -2395,20 +2492,77 @@ def _can_view_attendance(user):
     member = guild.get_member(user.id)
     return bool(member and any(r.id == TRAINER_ROLE_ID for r in member.roles))
 
-@tree.command(name="attendance", description="Owner/trainers: attendance — today, this week, or this month",
+def _parse_day_input(s):
+    """'2026-07-30', '7/30', or '7/30/26' -> date (current year assumed if missing)."""
+    s = (s or "").strip()
+    try: return dt.date.fromisoformat(s)
+    except Exception: pass
+    m = re.match(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", s)
+    if not m: return None
+    mo, dd, yy = int(m.group(1)), int(m.group(2)), m.group(3)
+    y = now_pt().year if not yy else (int(yy) + 2000 if len(yy) == 2 else int(yy))
+    try: return dt.date(y, mo, dd)
+    except Exception: return None
+
+def build_rows_for_day(d):
+    """Daily-card rows for any PAST day, straight from history (today uses live clocks)."""
+    if d.isoformat() == today_key():
+        ensure_today(); return build_daily_rows()
+    snap = load_json(HISTORY_FILE, {}).get(d.isoformat())
+    if not snap: return None
+    rows = []
+    for r in snap.values():
+        secs = r.get("seconds", 0); away = r.get("away_seconds", 0)
+        cp = (r.get("camera_seconds", 0) / secs) if secs else 0.0
+        if r.get("no_show"):                       status = "noshow"
+        elif r.get("late") and r.get("left_early"): status = "late+early"
+        elif r.get("late"):                        status = "late"
+        elif r.get("left_early"):                  status = "early"
+        elif away >= AWAY_FLAG_DAILY_MINS * 60:    status = "gaps"
+        else:                                      status = "ontime"
+        bits = []
+        if status == "noshow": bits.append("never joined a room")
+        if away >= AWAY_FLAG_DAILY_MINS * 60 and not r.get("no_show"):
+            bits.append(f"OUT {away_str(away)} of the day")
+        if secs >= CAMERA_MIN_MINS * 60 and cp < CAMERA_MIN_PCT: bits.append(f"LOW CAM {cp*100:.0f}%")
+        rows.append({"name": r["name"], "status": status, "detail": " · ".join(bits),
+                     "hours": secs / 3600.0, "cam": cp, "away": away})
+    rows.sort(key=lambda r: (r["status"] == "noshow", -r["hours"]))
+    return rows
+
+@tree.command(name="attendance", description="Owner/trainers: attendance — today, week, month, or any specific day",
               guild=discord.Object(GUILD_ID))
-@discord.app_commands.describe(period="Which view do you want?")
+@discord.app_commands.describe(period="Which view do you want?",
+                               day="Specific day to pull, e.g. 2026-07-30 or 7/30 (overrides the view)")
 @discord.app_commands.choices(period=[
     discord.app_commands.Choice(name="today", value="today"),
     discord.app_commands.Choice(name="this week", value="week"),
     discord.app_commands.Choice(name="this month", value="month"),
     discord.app_commands.Choice(name="hours vs production", value="quad")])
-async def cmd_attendance(interaction: discord.Interaction, period: discord.app_commands.Choice[str]):
+async def cmd_attendance(interaction: discord.Interaction,
+                         period: discord.app_commands.Choice[str] = None,
+                         day: str = None):
     if not _can_view_attendance(interaction.user):
         return await interaction.response.send_message("⛔ Owner and trainers only.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    p = period.value
+    p = period.value if period else ("today" if not day else None)
     try:
+        if day:
+            d = _parse_day_input(day)
+            if not d:
+                return await interaction.followup.send(
+                    "Couldn't read that date — try `2026-07-30` or `7/30`.", ephemeral=True)
+            rows = build_rows_for_day(d)
+            if not rows:
+                return await interaction.followup.send(
+                    f"No attendance history for **{d.strftime('%A, %B %-d, %Y')}**.", ephemeral=True)
+            wd = d.weekday()
+            s_t, e_t = SCHEDULE.get(wd), END_BY_DAY.get(wd)
+            buf = render_daily_card(d.strftime("%A, %B %-d"),
+                                    s_t.strftime("%-I:%M %p") if s_t else "—",
+                                    e_t.strftime("%-I:%M %p") if e_t else "—", rows)
+            if buf: return await interaction.followup.send(file=discord.File(buf, f"{d.isoformat()}.png"),
+                                                           ephemeral=True)
         if p == "today":
             ensure_today()
             rows = build_daily_rows()
@@ -2639,6 +2793,7 @@ async def on_ready():
         try: await refresh_accountability_board()
         except Exception as e: print("acct board", e)
     if not scheduler.is_running(): scheduler.start()
+    if not hours_boards_loop.is_running(): hours_boards_loop.start()
     if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
     if SUPABASE_KEY and not ip_poller.is_running(): ip_poller.start()
 
@@ -2660,7 +2815,7 @@ async def scheduler():
     if n.weekday() == WEEK_MATRIX_DAY and n.time() >= WEEK_MATRIX_TIME and _last_week_matrix != n.date():
         _last_week_matrix = n.date(); await post_weekly_attendance()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
-        _last_daily = n.date(); await post_daily_report()
+        _last_daily = n.date(); await close_out_day()   # silent close: flags -> history, no card posted
         await refresh_accountability_board()   # owner's bird's-eye board follows the daily close
         await check_sync_sentinel()            # data-pipe health check, once a day
     # 9 PM PT — daily deals total in #deals (late closes counted)
