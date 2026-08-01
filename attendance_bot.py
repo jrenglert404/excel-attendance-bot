@@ -81,7 +81,8 @@ DEALS_DAILY_TIME = dt.time(21, 0)   # daily deals total posts at 9 PM PT (after 
 WEEK_MATRIX_DAY  = 5                 # Saturday…
 WEEK_MATRIX_TIME = dt.time(15, 0)    # …3 PM PT — full Mon–Sat week is in the books by then
 WEEKLY_DAY  = 6                 # Sunday — the 6 PM PT "Sunday Wrap"
-MONTHLY_TIME = dt.time(10, 0)   # 1st-of-month reports post at 10 AM PT
+MONTHLY_TIME = dt.time(10, 0)   # month-close reports post at 10 AM PT...
+MONTHLY_REPORT_DAY = 5          # ...on the 5TH — Gateway's final week lands first, so issued-IP numbers are complete
 
 ARRIVAL_PINGS = False   # real-time ON-TIME clock-in lines (off — keeps the log clean)
 LATE_PINGS    = True    # real-time LATE arrival notes, as they join (owner + trainers)
@@ -1809,8 +1810,11 @@ async def refresh_team_ap_board():
     e = _team_board_embed(state, prod, label, kind="ap", deal_count=deal_count,
                           apps_map=_apps_by_agent(state, mkey))
     if not e: return
+    # Match THIS month's board only — when the month flips, last month's board stays
+    # frozen as a permanent record and a fresh post starts the new month.
+    this_title = f"🏆 Team Production — {label}"
     async for m in ch.history(limit=25):
-        if m.author == client.user and m.embeds and (m.embeds[0].title or "").startswith("🏆 Team"):
+        if m.author == client.user and m.embeds and (m.embeds[0].title or "") == this_title:
             try: await m.edit(embed=e)
             except Exception as ex: print("team edit", ex)
             return
@@ -2601,102 +2605,6 @@ async def cmd_attendance(interaction: discord.Interaction,
 
 
 # ---- monthly analytics (1st of month) --------------------------------------
-def render_trend_chart(labels, ap_vals, ip_vals):
-    """Simple branded AP-vs-IP bar chart. Returns BytesIO PNG or None."""
-    if not HAVE_PIL or not labels: return None
-    W, H = 1000, 520; PAD = 70
-    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
-    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
-    d.text((40, 28), "TEAM PRODUCTION TREND", font=_card_font(34, True), fill=CARD_GOLD)
-    d.text((40, 74), "Submitted AP (gold) vs Issued IP (white) by month", font=_card_font(20), fill=CARD_DIM)
-    peak = max(ap_vals + ip_vals + [1])
-    plot_top, plot_bot = 130, H - 80
-    n = len(labels); slot = (W - 2 * PAD) / max(n, 1)
-    for i in range(n):
-        cx = PAD + slot * i + slot / 2
-        for off, val, col in ((-22, ap_vals[i], CARD_GOLD), (4, ip_vals[i], CARD_WHITE)):
-            bh = int((plot_bot - plot_top) * (val / peak))
-            d.rectangle([cx + off, plot_bot - bh, cx + off + 18, plot_bot], fill=col)
-        f = _card_font(18); lw = d.textlength(labels[i], font=f)
-        d.text((cx - lw / 2, plot_bot + 12), labels[i], font=f, fill=CARD_WHITE)
-    d.text((40, H - 42), f"peak ${peak/1000:.0f}k · EXCEL FINANCIAL", font=_card_font(16), fill=CARD_DIM)
-    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
-    return buf
-
-async def post_trend_chart():
-    if not SUPABASE_KEY: return
-    ch = client.get_channel(TEAM_CH_ID)
-    if not ch: return
-    state = await fetch_app_state()
-    if not state: return
-    months = sorted((state.get("months") or {}).keys())[-6:]
-    labels, apv, ipv = [], [], []
-    for mk in months:
-        prod = _submitted_ap_by_agent(state, mk)
-        labels.append(_month_label(mk).split()[0][:3].upper())
-        apv.append(sum(prod.values()))
-        ipv.append(sum(_net_map(state, mk).values()))
-    if not any(apv) and not any(ipv): return
-    buf = render_trend_chart(labels, apv, ipv)
-    if not buf: return
-    try: await ch.send(file=discord.File(buf, filename="trend.png"))
-    except Exception as ex: print("trend", ex)
-
-def render_deal_clock(byday, byhour, label):
-    """Two bar panels: AP by day of week, and deals by hour of day (PT)."""
-    if not HAVE_PIL: return None
-    W, H = 1100, 560
-    img = Image.new("RGB", (W, H), CARD_BLACK); d = ImageDraw.Draw(img)
-    d.rectangle([10, 10, W - 11, H - 11], outline=CARD_GOLD, width=3)
-    d.text((40, 30), "DEAL CLOCK", font=_card_font(34, True), fill=CARD_GOLD)
-    d.text((40, 76), f"{label} · when the money actually happens (Pacific)", font=_card_font(19), fill=CARD_DIM)
-    def panel(x0, x1, title, keys, vals, fmtv):
-        top, bot = 150, H - 90
-        d.text((x0, top - 28), title, font=_card_font(18, True), fill=CARD_WHITE)
-        peak = max(vals + [1])
-        slot = (x1 - x0) / max(len(keys), 1)
-        for i, k in enumerate(keys):
-            bh = int((bot - top) * (vals[i] / peak))
-            bx = x0 + slot * i + slot * 0.18
-            col = CARD_GOLD if vals[i] == peak and peak > 0 else _blend(CARD_GOLD, 0.5)
-            d.rectangle([bx, bot - bh, bx + slot * 0.64, bot], fill=col)
-            f = _card_font(15); lw = d.textlength(str(k), font=f)
-            d.text((x0 + slot * i + (slot - lw) / 2, bot + 8), str(k), font=f, fill=CARD_DIM)
-            if vals[i] == peak and peak > 0:
-                vtxt = fmtv(vals[i]); vw = d.textlength(vtxt, font=f)
-                d.text((x0 + slot * i + (slot - vw) / 2, max(top + 4, bot - bh - 22)),
-                       vtxt, font=f, fill=CARD_BLACK if bh > (bot - top) - 26 else CARD_WHITE)
-    panel(50, 470, "AP BY DAY", ["MON","TUE","WED","THU","FRI","SAT"],
-          [byday.get(i, 0.0) for i in range(6)], lambda v: f"${v/1000:.0f}k")
-    hours = list(range(8, 20))
-    panel(520, W - 50, "DEALS BY HOUR", [str(h % 12 or 12) for h in hours],
-          [byhour.get(h, 0) for h in hours], lambda v: str(int(v)))
-    d.text((40, H - 44), "gold = peak · EXCEL FINANCIAL · owner + trainers", font=_card_font(15), fill=CARD_DIM)
-    buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
-    return buf
-
-async def post_deal_clock():
-    """Monthly: which days and hours produce — trailing 30 days of deals."""
-    if not SUPABASE_KEY: return
-    ch = client.get_channel(LOG_CHANNEL_ID)
-    if not ch: return
-    since = (now_pt() - dt.timedelta(days=30)).astimezone(dt.timezone.utc).isoformat()
-    try: deals = await fetch_deals_since(since)
-    except Exception as ex: print("deal clock", ex); return
-    if not deals: return
-    byday, byhour = {}, {}
-    for de in deals:
-        ts = de.get("posted_at")
-        if not ts: continue
-        try: t = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(PACIFIC)
-        except Exception: continue
-        if t.weekday() < 6: byday[t.weekday()] = byday.get(t.weekday(), 0.0) + _num(de.get("ap"))
-        byhour[t.hour] = byhour.get(t.hour, 0) + 1
-    buf = render_deal_clock(byday, byhour, "trailing 30 days")
-    if not buf: return
-    try: await ch.send(file=discord.File(buf, filename="dealclock.png"))
-    except Exception as ex: print("deal clock send", ex)
-
 async def post_persistency_watch():
     """Monthly, owner-only: suspected fall-offs the tracker's diff engine caught —
        policies that vanished or shrank between Gateway imports, grouped by rep."""
@@ -2802,10 +2710,10 @@ async def scheduler():
     global _last_daily, _last_weekly, _last_monthly
     n = now_pt(); ensure_today()
     # 1st of the month, 10 AM PT — team IP board + trend chart + NTG quality report
-    if SUPABASE_KEY and n.day == 1 and n.time() >= MONTHLY_TIME and _last_monthly != (n.year, n.month):
+    if SUPABASE_KEY and n.day == MONTHLY_REPORT_DAY and n.time() >= MONTHLY_TIME and _last_monthly != (n.year, n.month):
         _last_monthly = (n.year, n.month)
-        await post_team_ip_monthly(); await post_trend_chart(); await post_ntg_report()
-        await post_deal_clock(); await post_persistency_watch()
+        await post_team_ip_monthly(); await post_ntg_report()
+        await post_persistency_watch()
     # Saturday 2:10 PM — builder call roll
     global _last_builder
     if n.weekday() == BUILDER_DAY and n.time() >= BUILDER_CHECK and _last_builder != n.date():
