@@ -1859,15 +1859,25 @@ def _hours_board_embed(kind):
         dates = [first + dt.timedelta(days=i) for i in range((nxt - first).days)]
         sub = n.strftime("%B %Y")
     rows = _hours_totals(dates)
+    # Target = the SCHEDULED floor hours for the period (Mon 8:30–6 · Tue–Fri 9–6 · Sat 9–2).
+    # Hours count 24/7, so early birds and night grinders can EXCEED it: 11.5/9h ⭐.
+    if kind == "day":    target = scheduled_day_hours(tdy)
+    elif kind == "week": target = scheduled_week_hours()                    # 50.5
+    else:                target = sum(scheduled_day_hours(d) for d in dates)
     top = rows[0][1] if rows else 0.0
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, (nm, h) in enumerate(rows[:40]):
         tag = medals[i] if i < 3 else f"`{i + 1:>2}.`"
-        lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**")
+        if target > 0:
+            star = " ⭐" if h > target else ""
+            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}")
+        else:                                        # Sunday day-board: no schedule, plain hours
+            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**")
     body = f"*{sub}*\n\n" + ("\n".join(lines) if lines else "_No hours on the board yet._")
     e = discord.Embed(title=HOURS_BOARD_TITLES[kind], description=body, color=0xD4AF37)
-    e.set_footer(text=f"ALL Discord voice time · AFK not counted · auto-updates · {n.strftime('%-I:%M %p')} PT")
+    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · "
+                      f"⭐ = above & beyond · auto-updates · {n.strftime('%-I:%M %p')} PT")
     return e
 
 async def refresh_hours_boards():
@@ -1986,7 +1996,7 @@ async def refresh_accountability_board():
                     value="\n".join("• " + n for n in bad[:12]) + ("\n…" if len(bad) > 12 else ""),
                     inline=False)
     e.set_footer(text="Owner + trainers · L=late E=early NS=no-show · Out=hrs out of rooms 9–6 · Sc=Excel Score · daily")
-    async for msg in ch.history(limit=40):
+    async for msg in ch.history(limit=200):   # deep scan — LATE pings bury the board, and a missed find = duplicate board
         if msg.author == client.user and msg.embeds and (msg.embeds[0].title or "").startswith("📋 Accountability Board"):
             try: await msg.edit(embed=e)
             except Exception as ex: print("acct edit", ex)
