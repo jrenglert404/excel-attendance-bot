@@ -2085,24 +2085,27 @@ async def cmd_mystats(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     name = interaction.user.display_name
     lines = []
-    row = next((r for r in aggregate_week().values()
+    hist = load_json(HISTORY_FILE, {})
+    wk_agg = _merge_live_today(aggregate_dates(_week_dates()), hist)   # THIS Mon–Sat week
+    row = next((r for r in wk_agg.values()
                 if r["name"].strip().lower() == name.strip().lower()), None)
-    tdy = now_pt().date()
-    wk_poss = scheduled_hours_to_date([tdy - dt.timedelta(days=i) for i in range(7)])
+    wk_poss = scheduled_week_hours()   # full week schedule: Mon 8:30–6 + Tue–Fri 9–6 + Sat 9–2 = 50.5h
     if row:
         campct = (row["cam"] / row["hours"] * 100) if row["hours"] else 0
         wk_pct = (row["hours"] / wk_poss * 100) if wk_poss else 0
-        lines.append(f"**This week:** {row['hours']:.1f}h of {wk_poss:.1f}h possible — **{wk_pct:.0f}%** on the floor\n"
+        lines.append(f"**This week:** {row['hours']:.1f}h of {wk_poss:g}h scheduled — **{wk_pct:.0f}%** on the floor\n"
                      f"out {row.get('away', 0):.1f}h · camera {campct:.0f}% · {row['late']} late · {row['early']} early leave")
     else:
-        lines.append(f"**This week:** 0h of {wk_poss:.1f}h possible — no floor time logged yet")
+        lines.append(f"**This week:** 0h of {wk_poss:g}h scheduled — no floor time logged yet")
+    tdy = now_pt().date()
+    nxt = dt.date(tdy.year + (tdy.month == 12), (tdy.month % 12) + 1, 1)
+    mo_poss = sum(scheduled_day_hours(dt.date(tdy.year, tdy.month, d + 1))
+                  for d in range((nxt - tdy.replace(day=1)).days))
     mrow = next((r for r in aggregate_month().values()
                  if r["name"].strip().lower() == name.strip().lower()), None)
-    mo_poss = scheduled_hours_to_date([tdy.replace(day=1) + dt.timedelta(days=i)
-                                       for i in range((tdy - tdy.replace(day=1)).days + 1)])
     if mo_poss:
         mo_hours = mrow["hours"] if mrow else 0.0
-        lines.append(f"**This month:** {mo_hours:.1f}h of {mo_poss:.1f}h possible — "
+        lines.append(f"**This month:** {mo_hours:.1f}h of {mo_poss:g}h scheduled — "
                      f"**{(mo_hours / mo_poss * 100):.0f}%** on the floor")
     if SUPABASE_KEY:
         state = await fetch_app_state()
