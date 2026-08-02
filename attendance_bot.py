@@ -2017,29 +2017,36 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_m
         blocks.append(f"🏛️ **Excel Financial — {month_label}: ${floor_total:,.2f} AP**{dtxt}\n"
                       f"📈 Pace: day {n.day}/{days_in} · projecting **${int(round(proj)):,}** by month end")
     def _pfmt(v): return f"${v:,.2f}"                  # exact, to the penny
+    def _medal(i): return ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"`{i:>2}.`"
     if mrows:
-        head = f"{'#':<3}{'Manager':<20}{'Team '+metric:>14}{'Apps':>6}"
-        L = [head, "─" * len(head)]
-        for i, (a, tv, ap_n) in enumerate(mrows, 1):
-            L.append(f"{i:<3}{a[:19]:<20}{_pfmt(tv):>14}{(ap_n if ap_n else '—'):>6}")
-        blocks.append(f"__**👔 Manager Scoreboard — team {metric}**__\n```\n" + "\n".join(L) + "\n```")
-    prod_fields = []
+        mlines = [f"{_medal(i)} **{a}** — {_pfmt(tv)}" + (f" · {ap_n} apps" if ap_n else "")
+                  for i, (a, tv, ap_n) in enumerate(mrows, 1)]
+        blocks.append(f"__**👔 Manager Scoreboard — team {metric}**__\n" + "\n".join(mlines))
     if irows:
-        head = f"{'#':<3}{'Producer':<20}{metric:>14}{'Apps':>6}"
-        lines = [f"{i:<3}{a[:19]:<20}{_pfmt(v):>14}{(ap_n if ap_n else '—'):>6}"
-                 for i, (a, v, ap_n) in enumerate(irows, 1)]
-        CHUNK = 15                                        # 15 rows per field keeps every field < 1024 chars
-        for c in range(0, len(lines), CHUNK):
-            body = ([head, "─" * len(head)] if c == 0 else []) + lines[c:c + CHUNK]
-            prod_fields.append("```\n" + "\n".join(body) + "\n```")
+        plines = []
+        for i, (a, v, ap_n) in enumerate(irows, 1):
+            nm = f"**{a}**" if v > 0 else a               # zeros stay listed, just not bolded
+            plines.append(f"{_medal(i)} {nm} — {_pfmt(v)}" + (f" · {ap_n} apps" if ap_n else ""))
+        blocks.append(f"__**🙋 Producer Scoreboard — personal {metric}**__\n" + "\n".join(plines))
     if kind == "ip":
         title = f"🏅 Team IP — {month_label} (issued, month-end)"; color = 0xE67E22
     else:
         title = f"🏆 Team Production — {month_label}"; color = 0xF1C40F
-    e = discord.Embed(title=title, description="\n".join(blocks), color=color)
-    for i, c in enumerate(prod_fields):
-        e.add_field(name=f"🙋 Producer Scoreboard — personal {metric}" if i == 0
-                    else f"…continued ({i + 1})", value=c, inline=False)
+    desc = "\n\n".join(blocks)
+    e = discord.Embed(title=title, color=color)
+    if len(desc) <= 4096:
+        e.description = desc
+    else:                                                 # huge roster: split at a line break, no visible seam
+        cut = desc.rfind("\n", 0, 4096)
+        e.description = desc[:cut]
+        rest = desc[cut + 1:]
+        while rest:
+            piece = rest[:1024]
+            if len(rest) > 1024:
+                pc = piece.rfind("\n"); piece = piece[:pc]; rest = rest[len(piece) + 1:]
+            else:
+                rest = ""
+            e.add_field(name="\u200b", value=piece, inline=False)   # invisible field name — reads continuous
     e.set_footer(text="Manager = whole team rolled up (needs downline production) · Producer = personal · EVERY name on the roster, zeros included")
     return e
 
