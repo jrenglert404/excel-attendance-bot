@@ -2002,8 +2002,7 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_m
         a = str(a)
         if a not in have and str(a).lower() not in IP_EXCLUDE:
             irows.append((a, 0.0, int(apps_map.get(a, 0) or 0)))
-    irows.sort(key=lambda r: (-r[1], r[0]))
-    irows = irows[:35]                                    # embed size guard — roster is well under this
+    irows.sort(key=lambda r: (-r[1], r[0]))               # EVERYONE — no cap, chunked into fields below
     if not mrows and not irows: return None
     blocks = []
     # --- Excel Financial monthly total across the whole floor ---
@@ -2024,18 +2023,24 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_m
         for i, (a, tv, ap_n) in enumerate(mrows, 1):
             L.append(f"{i:<3}{a[:19]:<20}{_pfmt(tv):>14}{(ap_n if ap_n else '—'):>6}")
         blocks.append(f"__**👔 Manager Scoreboard — team {metric}**__\n```\n" + "\n".join(L) + "\n```")
+    prod_fields = []
     if irows:
         head = f"{'#':<3}{'Producer':<20}{metric:>14}{'Apps':>6}"
-        L = [head, "─" * len(head)]
-        for i, (a, v, ap_n) in enumerate(irows, 1):
-            L.append(f"{i:<3}{a[:19]:<20}{_pfmt(v):>14}{(ap_n if ap_n else '—'):>6}")
-        blocks.append(f"__**🙋 Producer Scoreboard — personal {metric}**__\n```\n" + "\n".join(L) + "\n```")
+        lines = [f"{i:<3}{a[:19]:<20}{_pfmt(v):>14}{(ap_n if ap_n else '—'):>6}"
+                 for i, (a, v, ap_n) in enumerate(irows, 1)]
+        CHUNK = 15                                        # 15 rows per field keeps every field < 1024 chars
+        for c in range(0, len(lines), CHUNK):
+            body = ([head, "─" * len(head)] if c == 0 else []) + lines[c:c + CHUNK]
+            prod_fields.append("```\n" + "\n".join(body) + "\n```")
     if kind == "ip":
         title = f"🏅 Team IP — {month_label} (issued, month-end)"; color = 0xE67E22
     else:
         title = f"🏆 Team Production — {month_label}"; color = 0xF1C40F
     e = discord.Embed(title=title, description="\n".join(blocks), color=color)
-    e.set_footer(text="Manager = whole team rolled up (needs downline production) · Producer = personal · FULL team, zeros included")
+    for i, c in enumerate(prod_fields):
+        e.add_field(name=f"🙋 Producer Scoreboard — personal {metric}" if i == 0
+                    else f"…continued ({i + 1})", value=c, inline=False)
+    e.set_footer(text="Manager = whole team rolled up (needs downline production) · Producer = personal · EVERY name on the roster, zeros included")
     return e
 
 def _prev_month_key():
