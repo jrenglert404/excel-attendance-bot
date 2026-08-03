@@ -557,41 +557,74 @@ async def announce_arrival(member, ts, late, start):
 
 
 # ---- ONE-TIME RECOVERY (Aug 3, 2026) ---------------------------------------
-# The 3:17 PM boot race wiped today's morning clocks. This seeds each affected
-# rep's total from the last good board snapshot (2:15 PM) plus the ~2 min gap to
-# the restart. Runs ONCE (flag file, cloud-mirrored), only on 2026-08-03, then inert.
+# The 3:17 PM boot race wiped today's morning clocks. FINAL plan per the owner:
+#   • Everyone IN a voice room at boot: full-day credit — total SET to (now − 8:30 AM),
+#     then their live clock keeps running from here.
+#   • Real join times + late flags restored from this morning's LATE pings.
+#   • Pinged this morning but gone by the restart: credited join → 2:17 PM (closed).
+#   • Top-10 snapshot values kept as a floor for anyone NOT in a room at boot.
+# SET (not add) semantics — safe even if an earlier recovery build already ran.
 RECOVERY_DAY = "2026-08-03"
 RECOVERY_HOURS = {"Ryan Gibson": 7.1, "Dylan Blair": 7.1, "Sethalvarez": 6.7,
                   "Hunter Fedde": 6.5, "Evangeline Cortez": 6.5, "joedelpino": 6.3,
                   "Adonis": 6.3, "Josh Davis": 6.0, "Sandon McCoy": 5.9,
                   "David Burkhard": 5.8}
-RECOVERY_GAP = 120          # seconds between the 2:15 snapshot and the restart
+RECOVERY_JOINS = {"Layton Rickert": "12:41", "Carson Seeker": "10:41", "Alex Saldamando": "9:56",
+                  "Killian Baker": "9:50", "Dylan Lackie": "9:38", "Ayden Halim": "8:59",
+                  "David Burkhard": "8:57", "Adonis": "8:56", "KARIS": "8:56", "Andrew": "8:51",
+                  "brittanyspears": "8:49", "Stephen Trevizo": "8:42", "Fletcher Graham": "8:35",
+                  "Hunter Fedde": "8:30", "Sethalvarez": "8:30"}
 
-def apply_recovery():
+def _rec_join_dt(nm, ts):
+    raw = RECOVERY_JOINS.get(nm)
+    if raw:
+        hh, mm = map(int, raw.split(":"))
+        if hh < 7: hh += 12
+        return ts.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return ts.replace(hour=8, minute=29, second=0, microsecond=0)
+
+def apply_recovery_final():
     if today_key() != RECOVERY_DAY: return
-    flag = load_json("recovery_20260803.json", {})
-    if flag.get("done"): return
+    if load_json("recovery_final_20260803.json", {}).get("done"): return
+    guild = client.get_guild(GUILD_ID)
+    if not guild: return
     ensure_today()
     ts = now_pt()
-    seeded = 0
+    day_start = ts.replace(hour=8, minute=30, second=0, microsecond=0)
+    restart = ts.replace(hour=14, minute=17, second=0, microsecond=0)
+    in_rooms = {str(mem.id) for vc in guild.voice_channels if is_work_channel(vc)
+                for mem in vc.members if not mem.bot}
+    credited = 0
     by_name = {rec["name"]: rec for rec in today.values()}
-    for nm, hrs in RECOVERY_HOURS.items():
-        base = int(hrs * 3600)
+    for mid, rec in today.items():
+        nm = rec["name"]
+        if mid in in_rooms:                              # on the floor RIGHT NOW: full day credit
+            rec["total_seconds"] = max((ts - day_start).total_seconds(), 0.0)
+            rec["enter_ts"] = ts.isoformat()             # live clock continues from here
+            jd = _rec_join_dt(nm, ts)
+            rec["first_join"] = jd.isoformat()
+            rec["late"] = jd.time() > dt.time(8, 30)
+            rec["present"] = True; rec["last_leave"] = None
+            credited += 1
+    for nm in set(RECOVERY_JOINS) | set(RECOVERY_HOURS): # not in a room now: best surviving record
+        if nm in by_name and str(next(m for m, r in today.items() if r["name"] == nm)) in in_rooms:
+            continue
         rec = by_name.get(nm)
-        if rec is not None:                              # still on the floor: seed + gap credit
-            rec["total_seconds"] = float(rec.get("total_seconds") or 0) + base + RECOVERY_GAP
-            rec["first_join"] = ts.replace(hour=8, minute=29, second=0, microsecond=0).isoformat()
-            rec["late"] = False                          # their real morning joins were wiped too
-            seeded += 1
-        else:                                            # left before the restart: seed a closed rec
-            today["recovered_" + nm] = {"name": nm, "first_join": ts.replace(hour=8, minute=29,
-                second=0, microsecond=0).isoformat(), "last_leave": ts.isoformat(),
-                "enter_ts": None, "total_seconds": float(base), "present": False,
-                "late": False, "camera_on": False, "cam_ts": None, "camera_seconds": 0.0}
-            seeded += 1
-    save_json("recovery_20260803.json", {"done": True})
+        jd = _rec_join_dt(nm, ts)
+        base = max(RECOVERY_HOURS.get(nm, 0) * 3600, (restart - jd).total_seconds())
+        if rec is None:
+            today["recovered_" + nm] = {"name": nm, "first_join": jd.isoformat(),
+                "last_leave": restart.isoformat(), "enter_ts": None, "total_seconds": float(base),
+                "present": False, "late": jd.time() > dt.time(8, 30),
+                "camera_on": False, "cam_ts": None, "camera_seconds": 0.0}
+            credited += 1
+        elif not rec.get("present"):
+            rec["total_seconds"] = max(float(rec.get("total_seconds") or 0), float(base))
+            rec["first_join"] = jd.isoformat(); rec["late"] = jd.time() > dt.time(8, 30)
+            credited += 1
+    save_json("recovery_final_20260803.json", {"done": True})
     save_state()
-    print(f"recovery: seeded {seeded} rep(s) from the 2:15 PM snapshot")
+    print(f"recovery final: credited {credited} rep(s)")
 
 # ---- history / flags ------------------------------------------------------
 def snapshot_today():
@@ -2193,6 +2226,29 @@ async def refresh_hours_boards():
                 except Exception: pass
             except Exception as ex: print("hours send", ex)
 
+# ---- versioned state backups -------------------------------------------------
+# Hourly snapshot of the live clocks under a dated key in bot_state, kept ~48h.
+# If state is ever lost or corrupted again, restore = copy a backup row's data
+# into the attendance_state.json row (SQL editor) and reboot — a TRUE backdate,
+# not a reconstruction. The main mirror row is unchanged and still updates live.
+BACKUP_KEEP_HOURS = 48
+
+@tasks.loop(minutes=60)
+async def state_backup_loop():
+    try:
+        ensure_today()
+        key = f"backup_state_{now_pt().strftime('%Y-%m-%d_%Hh')}.json"
+        await _cloud_push_state(key, {"day": current_day, "today": today})
+        cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=BACKUP_KEEP_HOURS)).isoformat()
+        url = f"{SUPABASE_URL}/rest/v1/{BOT_STATE_TABLE}"
+        headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
+        async with aiohttp.ClientSession() as s:
+            async with s.delete(url, params={"id": "like.backup_state_*", "updated_at": f"lt.{cutoff}"},
+                                headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status not in (200, 204): print("backup prune", r.status)
+    except Exception as ex:
+        print("state backup", ex)
+
 @tasks.loop(seconds=240)
 async def hours_boards_loop():
     try: await refresh_hours_boards()
@@ -2906,7 +2962,7 @@ async def on_ready():
     _state_ready = True                            # voice events may flow now — state is safe
     try: sync_current_voice()                      # pick up anyone already mid-session
     except Exception as e: print("voice rescan", e)
-    try: apply_recovery()                          # one-time Aug 3 hour restoration
+    try: apply_recovery_final()                    # one-time Aug 3 hour restoration
     except Exception as e: print("recovery", e)
     try: recheck_lates()                           # heal stale late flags after schedule changes
     except Exception as e: print("recheck lates", e)
@@ -2929,6 +2985,7 @@ async def on_ready():
         except Exception as e: print("roi board", e)
     if not scheduler.is_running(): scheduler.start()
     if not hours_boards_loop.is_running(): hours_boards_loop.start()
+    if SUPABASE_KEY and not state_backup_loop.is_running(): state_backup_loop.start()
     if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
     if SUPABASE_KEY and not ip_poller.is_running(): ip_poller.start()
 
