@@ -110,9 +110,6 @@ WINS_STATE_FILE = "wins_state.json"
 # --- Recognition hub (#recognition — the repurposed #weekly-report channel) ---
 RECOGNITION_CH_ID = 1531496475379499222
 WEEKLY_APPS_GOAL = 150         # team's weekly apps goal — change to your real number
-MILESTONE_DEALS = [25, 50, 75, 100, 150, 200, 300]
-MILESTONE_AP    = [25000, 50000, 100000, 150000, 200000, 300000]
-MILESTONE_FILE  = "milestone_state.json"
 
 # --- IP Reports: Issued Premium scoreboard from the tracker's Gateway MTD imports ---
 # Reads the same Supabase app_state blob your Goal & Commit Tracker syncs to. Each time
@@ -874,19 +871,6 @@ async def post_sunday_wrap():
         e.add_field(name="⏱️ Top Hours",
             value="\n".join(f"**{i+1}.** {r['name']} — {r['hours']:.1f}h" for i, r in enumerate(top)) or "—",
             inline=False)
-        # Excel Score — month-to-date top 5 (production + attentiveness in one number)
-        try:
-            st_data = await fetch_app_state() if SUPABASE_KEY else None
-            sc = compute_excel_scores(st_data)
-            sc_rows = sorted(((n2, r2["pts"]) for n2, r2 in sc.items()
-                              if str(n2).lower() not in IP_EXCLUDE), key=lambda kv: kv[1], reverse=True)[:5]
-            if sc_rows:
-                e.add_field(name="🏅 Excel Score — month to date",
-                    value="\n".join(f"**{i+1}.** {n2} — {p} pts" for i, (n2, p) in enumerate(sc_rows))
-                          + "\n*+1/$1k AP · +2 on-time day · −2 late/early · −4 no-show*",
-                    inline=False)
-        except Exception as ex:
-            print("wrap score", ex)
         # personal-best weeks (results-only; zero extra messages — lives inside the wrap)
         pb = load_json(PB_FILE, {})
         new_bests = []
@@ -1193,38 +1177,12 @@ async def wins_poller():
     seen_list = list(seen)[-1000:]
     save_json(WINS_STATE_FILE, {"seen": seen_list, "init": True})
     if new_posted:
-        await check_milestones()
         await check_streaks(new_agents)
         await refresh_team_ap_board()   # live team-production board follows new deals
         await refresh_lead_roi_board()  # ROI board moves with every submitted deal
         await refresh_leaders_board()   # 💰 crown can change hands on a new deal
 
-async def check_milestones():
-    rec = client.get_channel(RECOGNITION_CH_ID)
-    if not rec: return
-    start = (now_pt() - dt.timedelta(days=7)).astimezone(dt.timezone.utc).isoformat()
-    try: deals = await fetch_deals_since(start)
-    except Exception: return
-    s = summarize_deals(deals)
-    wk = now_pt().strftime("%Y-W%W")
-    st = load_json(MILESTONE_FILE, {})
-    hit = st.get(wk, {"deals": [], "ap": []})
-    changed = False
-    for m in MILESTONE_DEALS:
-        if s["count"] >= m and m not in hit["deals"]:
-            hit["deals"].append(m); changed = True
-            try: await rec.send(f"🎉 **{m} deals** closed this week and climbing — let's go! 🔥")
-            except Exception as e: print("milestone", e)
-    for m in MILESTONE_AP:
-        if s["ap"] >= m and m not in hit["ap"]:
-            hit["ap"].append(m); changed = True
-            try: await rec.send(f"💥 **${m:,} AP** this week! Momentum is real. 🚀")
-            except Exception as e: print("milestone", e)
-    if changed:
-        st[wk] = hit; save_json(MILESTONE_FILE, st)
 
-
-# ---- deals totals (daily + weekly summary in #deals) ----------------------
 async def fetch_deals_since(iso):
     url = f"{SUPABASE_URL}/rest/v1/deals"
     headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
@@ -1981,7 +1939,7 @@ def _apps_by_agent(state, mkey):
         if v: out[str(a)] = v
     return out
 
-def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_map=None):
+def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_map=None, mkey=None):
     metric = "IP" if kind == "ip" else "AP"
     team = _team_rollup(state, prod)
     apps_map = apps_map or {}
@@ -2012,10 +1970,14 @@ def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_m
     else:
         dtxt = f" · **{deal_count} deals**" if deal_count else ""
         n = now_pt()
-        days_in = (dt.date(n.year + (n.month == 12), (n.month % 12) + 1, 1) - dt.date(n.year, n.month, 1)).days
-        proj = floor_total / max(n.day, 1) * days_in
-        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${floor_total:,.2f} AP**{dtxt}\n"
-                      f"📈 Pace: day {n.day}/{days_in} · projecting **${int(round(proj)):,}** by month end")
+        y, mo = (int(mkey[:4]), int(mkey[5:7])) if mkey else (n.year, n.month)
+        days_in = (dt.date(y + (mo == 12), (mo % 12) + 1, 1) - dt.date(y, mo, 1)).days
+        if (n.year, n.month) == (y, mo):                 # live month: pace + projection
+            proj = floor_total / max(n.day, 1) * days_in
+            pace = f"📈 Pace: day {n.day}/{days_in} · projecting **${int(round(proj)):,}** by month end"
+        else:                                            # finished month: a record, not a race
+            pace = f"🏁 Final — {days_in}/{days_in} days"
+        blocks.append(f"🏛️ **Excel Financial — {month_label}: ${floor_total:,.2f} AP**{dtxt}\n{pace}")
     def _pfmt(v): return f"${v:,.2f}"                  # exact, to the penny
     def _medal(i): return ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"`{i:>2}.`"
     if mrows:
@@ -2068,7 +2030,7 @@ async def refresh_team_ap_board(mkey=None):
     mdeals = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
     deal_count = sum(len(chips or []) for chips in mdeals.values())
     e = _team_board_embed(state, prod, label, kind="ap", deal_count=deal_count,
-                          apps_map=_apps_by_agent(state, mkey))
+                          apps_map=_apps_by_agent(state, mkey), mkey=mkey)
     if not e: return
     # Match THIS month's board only — when the month flips, last month's board stays
     # frozen as a permanent record and a fresh post starts the new month.
@@ -2195,29 +2157,6 @@ async def post_team_ip_monthly():
     except Exception as ex: print("team ip send", ex)
 
 
-# ---- Excel Score + Accountability Board ------------------------------------
-# EXCEL SCORE (monthly, resets on the 1st): production first, attentiveness enforced.
-#   +1 pt per $1,000 submitted AP · +2 per on-time day · −2 per late · −2 per early
-#   leave · −4 per no-show. Public: top 5 in the Sunday Wrap + /mystats. Full table
-#   lives on the owner's private Accountability Board.
-def compute_excel_scores(state):
-    att = aggregate_month()
-    prod = _submitted_ap_by_agent(state, _live_month_key()) if state else {}
-    prod_low = {str(k).strip().lower(): v for k, v in prod.items()}
-    used = set()
-    rows = {}
-    for mid, a in att.items():
-        nm = a["name"]; low = nm.strip().lower()
-        ap = float(prod_low.get(low, 0.0)); used.add(low)
-        ontime = max(a["present"] - a["late"], 0)
-        pts = round(ap / 1000) + 2*ontime - 2*a["late"] - 2*a["early"] - 4*a["noshow"]
-        rows[nm] = {"pts": pts, "ap": ap,
-                    **{k: a.get(k, 0) for k in ("late", "early", "noshow", "present", "hours", "cam", "away")}}
-    for nm, ap in prod.items():                       # producers with no attendance record yet
-        if str(nm).strip().lower() in used: continue
-        rows[nm] = {"pts": round(float(ap)/1000), "ap": float(ap),
-                    "late": 0, "early": 0, "noshow": 0, "present": 0, "hours": 0.0, "cam": 0.0, "away": 0.0}
-    return rows
 
 # ---- Weekly Attendance Matrix (owner + trainers, #attendance-log) ----------
 def _blend(c, a=0.42, bg=CARD_BLACK):
@@ -2446,17 +2385,6 @@ async def cmd_mystats(interaction: discord.Interaction):
                 lines.append(seg)
         else:
             lines.append("_Couldn't match your nickname to the roster — set your server nickname to your real name._")
-        try:
-            sc = compute_excel_scores(state)
-            ranked = sorted(((n2, r2["pts"]) for n2, r2 in sc.items()
-                             if str(n2).lower() not in IP_EXCLUDE), key=lambda kv: kv[1], reverse=True)
-            mine = next(((i + 1, p) for i, (n2, p) in enumerate(ranked)
-                         if n2.strip().lower() == name.strip().lower()
-                         or (canon and n2.strip().lower() == canon.strip().lower())), None)
-            if mine:
-                lines.append(f"**Excel Score:** {mine[1]} pts · #{mine[0]} of {len(ranked)}")
-        except Exception as ex:
-            print("mystats score", ex)
     e = discord.Embed(title=f"📊 {name}", description="\n".join(lines), color=0x1ABC9C)
     await interaction.followup.send(embed=e, ephemeral=True)
 
