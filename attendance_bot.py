@@ -506,34 +506,52 @@ def recheck_lates():
         save_state(); print("recheck_lates: corrected stale late flags")
 
 def sync_current_voice():
-    """On boot: pick up everyone ALREADY sitting in a work room, so a redeploy in the
-       middle of a call session never loses live tracking. Anyone the bot thought had
-       left (or never saw) gets their clock restarted from now."""
+    """On boot: reconcile the bot's clocks with REALITY, both directions.
+       (1) Pick up everyone already sitting in a work room, so a redeploy mid-session
+           never loses live tracking.
+       (2) Close out anyone the state says is present/on-camera who ISN'T actually in a
+           room (or whose camera is actually off) — they left or toggled during the
+           downtime. Without this, phantom clocks keep running and camera %% inflates
+           toward 100 after every redeploy."""
     guild = client.get_guild(GUILD_ID)
     if not guild: return
     ensure_today()
-    ts = now_pt(); found = 0
+    ts = now_pt(); found = 0; closed = 0; cam_fixed = 0
+    in_rooms = {}                                     # mid -> member (actually in a work room now)
     for vc in guild.voice_channels:
         if not is_work_channel(vc): continue
         for mem in vc.members:
-            if mem.bot: continue
-            mid = str(mem.id); rec = today.get(mid)
-            cam = bool(mem.voice and mem.voice.self_video)
-            if rec is None:
-                start = scheduled_start_today()
-                late = start is not None and ts.time() > start
-                today[mid] = {"name": mem.display_name, "first_join": ts.isoformat(),
-                              "last_leave": None, "enter_ts": ts.isoformat(), "total_seconds": 0.0,
-                              "present": True, "late": late, "camera_on": cam,
-                              "cam_ts": ts.isoformat() if cam else None, "camera_seconds": 0.0}
-                found += 1
-            else:
-                if not rec.get("enter_ts"): rec["enter_ts"] = ts.isoformat(); found += 1
-                rec["present"] = True; rec["last_leave"] = None
-                if cam and not rec.get("camera_on"):
-                    rec["camera_on"] = True; rec["cam_ts"] = ts.isoformat()
-    if found:
-        save_state(); print(f"voice rescan: picked up {found} member(s) already in rooms")
+            if not mem.bot: in_rooms[str(mem.id)] = mem
+    for mid, mem in in_rooms.items():
+        rec = today.get(mid)
+        cam = bool(mem.voice and mem.voice.self_video)
+        if rec is None:
+            start = scheduled_start_today()
+            late = start is not None and ts.time() > start
+            today[mid] = {"name": mem.display_name, "first_join": ts.isoformat(),
+                          "last_leave": None, "enter_ts": ts.isoformat(), "total_seconds": 0.0,
+                          "present": True, "late": late, "camera_on": cam,
+                          "cam_ts": ts.isoformat() if cam else None, "camera_seconds": 0.0}
+            found += 1
+        else:
+            if not rec.get("enter_ts"): rec["enter_ts"] = ts.isoformat(); found += 1
+            rec["present"] = True; rec["last_leave"] = None
+            if cam and not rec.get("camera_on"):
+                rec["camera_on"] = True; rec["cam_ts"] = ts.isoformat()
+            elif not cam and rec.get("camera_on"):     # camera went OFF while bot was down
+                rec["camera_seconds"] = live_camera(rec)
+                rec["camera_on"] = False; rec["cam_ts"] = None; cam_fixed += 1
+    for mid, rec in today.items():                     # phantom clocks: marked present, not in any room
+        if rec.get("present") and mid not in in_rooms:
+            if rec.get("camera_on") and rec.get("cam_ts"):
+                rec["camera_seconds"] = live_camera(rec)
+            rec["camera_on"] = False; rec["cam_ts"] = None
+            if rec.get("enter_ts"): rec["total_seconds"] = live_seconds(rec)
+            rec["enter_ts"] = None; rec["present"] = False; rec["last_leave"] = ts.isoformat()
+            closed += 1
+    if found or closed or cam_fixed:
+        save_state()
+        print(f"voice rescan: +{found} picked up · {closed} phantom clock(s) closed · {cam_fixed} stale camera(s) fixed")
 
 async def announce_arrival(member, ts, late, start):
     """LATE arrivals post to #attendance-log in real time (LATE_PINGS); on-time joins
