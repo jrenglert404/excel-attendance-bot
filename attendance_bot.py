@@ -626,6 +626,27 @@ def apply_recovery_final():
     save_state()
     print(f"recovery final: credited {credited} rep(s)")
 
+# One-off (Aug 3, 2026): owner-directed — "Andrew" (exact Discord name) gets
+# EXACTLY 1 hour total for today, overriding any recovery credit. Runs AFTER the
+# recovery pass, so this is his final backdated number; anything he actually works
+# from this moment on still counts on top via his live clock.
+def apply_credit_andrew():
+    if today_key() != "2026-08-03": return
+    if load_json("credit_andrew_20260803.json", {}).get("done"): return
+    ensure_today()
+    ts = now_pt()
+    rec = next((r for r in today.values() if r["name"].strip().lower() == "andrew"), None)
+    if rec is None:
+        today["credited_andrew"] = {"name": "Andrew", "first_join": ts.isoformat(),
+            "last_leave": ts.isoformat(), "enter_ts": None, "total_seconds": 3600.0,
+            "present": False, "late": True, "camera_on": False, "cam_ts": None,
+            "camera_seconds": 0.0}
+    else:
+        rec["total_seconds"] = 3600.0                    # exactly one hour, not one hour added
+    save_json("credit_andrew_20260803.json", {"done": True})
+    save_state()
+    print("Andrew set to exactly 1.0h for today")
+
 # ---- history / flags ------------------------------------------------------
 def snapshot_today():
     guild = client.get_guild(GUILD_ID)
@@ -2964,6 +2985,8 @@ async def on_ready():
     except Exception as e: print("voice rescan", e)
     try: apply_recovery_final()                    # one-time Aug 3 hour restoration
     except Exception as e: print("recovery", e)
+    try: apply_credit_andrew()                     # owner-directed: Andrew = exactly 1h today
+    except Exception as e: print("andrew credit", e)
     try: recheck_lates()                           # heal stale late flags after schedule changes
     except Exception as e: print("recheck lates", e)
     await ensure_start_message()
