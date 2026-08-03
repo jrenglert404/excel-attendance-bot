@@ -647,6 +647,23 @@ def apply_credit_andrew():
     save_state()
     print("Andrew set to exactly 1.0h for today")
 
+# One-off (Aug 3, 2026): the wipe destroyed today's real camera clocks, so per the
+# owner: everyone gets 100%% camera credit for today's logged time. Tomorrow onward
+# camera %% is genuine. READ/WRITE camera_seconds only — hour totals never touched.
+def apply_camera_backfill():
+    if today_key() != "2026-08-03": return
+    if load_json("camera_backfill_20260803.json", {}).get("done"): return
+    ensure_today()
+    ts = now_pt()
+    for rec in today.values():
+        rec["camera_seconds"] = float(live_seconds(rec))     # camera == floor time so far
+        if rec.get("present") and rec.get("enter_ts"):
+            rec["camera_on"] = True                          # keep 100%% rolling while they work
+            rec["cam_ts"] = ts.isoformat()
+    save_json("camera_backfill_20260803.json", {"done": True})
+    save_state()
+    print("camera backfill: everyone credited 100%% for today")
+
 # ---- history / flags ------------------------------------------------------
 def snapshot_today():
     guild = client.get_guild(GUILD_ID)
@@ -2174,9 +2191,11 @@ HOURS_BOARD_TITLES = {"day": "🕐 Hours — Today", "week": "🗓️ Hours — 
                       "month": "📆 Hours — This Month"}
 
 def _hours_totals(dates):
-    """[(name, hours)] across dates — history for finished days, live clocks for today."""
+    """[(name, hours, cam_pct)] across dates. Hours math is UNCHANGED from the stable
+       version — camera is a read-only overlay computed from the same records, capped
+       at 100%, and can never alter an hour total."""
     hist = load_json(HISTORY_FILE, {})
-    tk = today_key(); tot = {}
+    tk = today_key(); tot = {}; cam = {}
     want_today = False
     for d in dates:
         iso = d.isoformat()
@@ -2184,11 +2203,15 @@ def _hours_totals(dates):
         for r in (hist.get(iso) or {}).values():
             if r.get("seconds", 0) > 0:
                 tot[r["name"]] = tot.get(r["name"], 0.0) + r["seconds"] / 3600.0
+                cam[r["name"]] = cam.get(r["name"], 0.0) + r.get("camera_seconds", 0) / 3600.0
     if want_today:
         for rec in today.values():
             s = live_seconds(rec)
-            if s > 0: tot[rec["name"]] = tot.get(rec["name"], 0.0) + s / 3600.0
-    return sorted(tot.items(), key=lambda kv: (-kv[1], kv[0]))
+            if s > 0:
+                tot[rec["name"]] = tot.get(rec["name"], 0.0) + s / 3600.0
+                cam[rec["name"]] = cam.get(rec["name"], 0.0) + live_camera(rec) / 3600.0
+    rows = [(n, h, min((cam.get(n, 0.0) / h * 100) if h else 0.0, 100.0)) for n, h in tot.items()]
+    return sorted(rows, key=lambda r: (-r[1], r[0]))
 
 def _hours_board_embed(kind):
     n = now_pt(); tdy = n.date()
@@ -2212,16 +2235,17 @@ def _hours_board_embed(kind):
     top = rows[0][1] if rows else 0.0
     medals = ["🥇", "🥈", "🥉"]
     lines = []
-    for i, (nm, h) in enumerate(rows[:40]):
+    for i, (nm, h, cp) in enumerate(rows[:40]):
         tag = medals[i] if i < 3 else f"`{i + 1:>2}.`"
+        camtxt = f" · 📷 {cp:.0f}%"
         if target > 0:
             star = " ⭐" if h > target else ""
-            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}")
+            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}{camtxt}")
         else:                                        # Sunday day-board: no schedule, plain hours
-            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**")
+            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**{camtxt}")
     body = f"*{sub}*\n\n" + ("\n".join(lines) if lines else "_No hours on the board yet._")
     e = discord.Embed(title=HOURS_BOARD_TITLES[kind], description=body, color=0xD4AF37)
-    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · "
+    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · 📷 % of floor time on camera · "
                       f"⭐ = above & beyond · auto-updates · {n.strftime('%-I:%M %p')} PT")
     return e
 
@@ -2987,6 +3011,8 @@ async def on_ready():
     except Exception as e: print("recovery", e)
     try: apply_credit_andrew()                     # owner-directed: Andrew = exactly 1h today
     except Exception as e: print("andrew credit", e)
+    try: apply_camera_backfill()                   # Aug 3 only: 100%% camera credit for today
+    except Exception as e: print("camera backfill", e)
     try: recheck_lates()                           # heal stale late flags after schedule changes
     except Exception as e: print("recheck lates", e)
     await ensure_start_message()
