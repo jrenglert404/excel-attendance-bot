@@ -446,9 +446,11 @@ def away_str(sec):
 
 
 # ---- voice + camera tracking ---------------------------------------------
+_state_ready = False    # True once the cloud restore + load finish at boot; events
+                        # before that are dropped so they can't clobber the backup
 @client.event
 async def on_voice_state_update(member, before, after):
-    if member.bot: return
+    if member.bot or not _state_ready: return
     ensure_today()
     was, now = is_work_channel(before.channel), is_work_channel(after.channel)
     ts = now_pt(); mid = str(member.id); rec = today.get(mid)
@@ -506,52 +508,34 @@ def recheck_lates():
         save_state(); print("recheck_lates: corrected stale late flags")
 
 def sync_current_voice():
-    """On boot: reconcile the bot's clocks with REALITY, both directions.
-       (1) Pick up everyone already sitting in a work room, so a redeploy mid-session
-           never loses live tracking.
-       (2) Close out anyone the state says is present/on-camera who ISN'T actually in a
-           room (or whose camera is actually off) — they left or toggled during the
-           downtime. Without this, phantom clocks keep running and camera %% inflates
-           toward 100 after every redeploy."""
+    """On boot: pick up everyone ALREADY sitting in a work room, so a redeploy in the
+       middle of a call session never loses live tracking. Anyone the bot thought had
+       left (or never saw) gets their clock restarted from now."""
     guild = client.get_guild(GUILD_ID)
     if not guild: return
     ensure_today()
-    ts = now_pt(); found = 0; closed = 0; cam_fixed = 0
-    in_rooms = {}                                     # mid -> member (actually in a work room now)
+    ts = now_pt(); found = 0
     for vc in guild.voice_channels:
         if not is_work_channel(vc): continue
         for mem in vc.members:
-            if not mem.bot: in_rooms[str(mem.id)] = mem
-    for mid, mem in in_rooms.items():
-        rec = today.get(mid)
-        cam = bool(mem.voice and mem.voice.self_video)
-        if rec is None:
-            start = scheduled_start_today()
-            late = start is not None and ts.time() > start
-            today[mid] = {"name": mem.display_name, "first_join": ts.isoformat(),
-                          "last_leave": None, "enter_ts": ts.isoformat(), "total_seconds": 0.0,
-                          "present": True, "late": late, "camera_on": cam,
-                          "cam_ts": ts.isoformat() if cam else None, "camera_seconds": 0.0}
-            found += 1
-        else:
-            if not rec.get("enter_ts"): rec["enter_ts"] = ts.isoformat(); found += 1
-            rec["present"] = True; rec["last_leave"] = None
-            if cam and not rec.get("camera_on"):
-                rec["camera_on"] = True; rec["cam_ts"] = ts.isoformat()
-            elif not cam and rec.get("camera_on"):     # camera went OFF while bot was down
-                rec["camera_seconds"] = live_camera(rec)
-                rec["camera_on"] = False; rec["cam_ts"] = None; cam_fixed += 1
-    for mid, rec in today.items():                     # phantom clocks: marked present, not in any room
-        if rec.get("present") and mid not in in_rooms:
-            if rec.get("camera_on") and rec.get("cam_ts"):
-                rec["camera_seconds"] = live_camera(rec)
-            rec["camera_on"] = False; rec["cam_ts"] = None
-            if rec.get("enter_ts"): rec["total_seconds"] = live_seconds(rec)
-            rec["enter_ts"] = None; rec["present"] = False; rec["last_leave"] = ts.isoformat()
-            closed += 1
-    if found or closed or cam_fixed:
-        save_state()
-        print(f"voice rescan: +{found} picked up · {closed} phantom clock(s) closed · {cam_fixed} stale camera(s) fixed")
+            if mem.bot: continue
+            mid = str(mem.id); rec = today.get(mid)
+            cam = bool(mem.voice and mem.voice.self_video)
+            if rec is None:
+                start = scheduled_start_today()
+                late = start is not None and ts.time() > start
+                today[mid] = {"name": mem.display_name, "first_join": ts.isoformat(),
+                              "last_leave": None, "enter_ts": ts.isoformat(), "total_seconds": 0.0,
+                              "present": True, "late": late, "camera_on": cam,
+                              "cam_ts": ts.isoformat() if cam else None, "camera_seconds": 0.0}
+                found += 1
+            else:
+                if not rec.get("enter_ts"): rec["enter_ts"] = ts.isoformat(); found += 1
+                rec["present"] = True; rec["last_leave"] = None
+                if cam and not rec.get("camera_on"):
+                    rec["camera_on"] = True; rec["cam_ts"] = ts.isoformat()
+    if found:
+        save_state(); print(f"voice rescan: picked up {found} member(s) already in rooms")
 
 async def announce_arrival(member, ts, late, start):
     """LATE arrivals post to #attendance-log in real time (LATE_PINGS); on-time joins
@@ -571,6 +555,43 @@ async def announce_arrival(member, ts, late, start):
     try: await ch.send(f"🟢 {member.display_name} clocked in at **{fmt(ts)}** — on time.")
     except Exception as e: print("announce", e)
 
+
+# ---- ONE-TIME RECOVERY (Aug 3, 2026) ---------------------------------------
+# The 3:17 PM boot race wiped today's morning clocks. This seeds each affected
+# rep's total from the last good board snapshot (2:15 PM) plus the ~2 min gap to
+# the restart. Runs ONCE (flag file, cloud-mirrored), only on 2026-08-03, then inert.
+RECOVERY_DAY = "2026-08-03"
+RECOVERY_HOURS = {"Ryan Gibson": 7.1, "Dylan Blair": 7.1, "Sethalvarez": 6.7,
+                  "Hunter Fedde": 6.5, "Evangeline Cortez": 6.5, "joedelpino": 6.3,
+                  "Adonis": 6.3, "Josh Davis": 6.0, "Sandon McCoy": 5.9,
+                  "David Burkhard": 5.8}
+RECOVERY_GAP = 120          # seconds between the 2:15 snapshot and the restart
+
+def apply_recovery():
+    if today_key() != RECOVERY_DAY: return
+    flag = load_json("recovery_20260803.json", {})
+    if flag.get("done"): return
+    ensure_today()
+    ts = now_pt()
+    seeded = 0
+    by_name = {rec["name"]: rec for rec in today.values()}
+    for nm, hrs in RECOVERY_HOURS.items():
+        base = int(hrs * 3600)
+        rec = by_name.get(nm)
+        if rec is not None:                              # still on the floor: seed + gap credit
+            rec["total_seconds"] = float(rec.get("total_seconds") or 0) + base + RECOVERY_GAP
+            rec["first_join"] = ts.replace(hour=8, minute=29, second=0, microsecond=0).isoformat()
+            rec["late"] = False                          # their real morning joins were wiped too
+            seeded += 1
+        else:                                            # left before the restart: seed a closed rec
+            today["recovered_" + nm] = {"name": nm, "first_join": ts.replace(hour=8, minute=29,
+                second=0, microsecond=0).isoformat(), "last_leave": ts.isoformat(),
+                "enter_ts": None, "total_seconds": float(base), "present": False,
+                "late": False, "camera_on": False, "cam_ts": None, "camera_seconds": 0.0}
+            seeded += 1
+    save_json("recovery_20260803.json", {"done": True})
+    save_state()
+    print(f"recovery: seeded {seeded} rep(s) from the 2:15 PM snapshot")
 
 # ---- history / flags ------------------------------------------------------
 def snapshot_today():
@@ -2099,9 +2120,9 @@ HOURS_BOARD_TITLES = {"day": "🕐 Hours — Today", "week": "🗓️ Hours — 
                       "month": "📆 Hours — This Month"}
 
 def _hours_totals(dates):
-    """[(name, hours, cam_pct)] across dates — history for finished days, live for today."""
+    """[(name, hours)] across dates — history for finished days, live clocks for today."""
     hist = load_json(HISTORY_FILE, {})
-    tk = today_key(); tot = {}; cam = {}
+    tk = today_key(); tot = {}
     want_today = False
     for d in dates:
         iso = d.isoformat()
@@ -2109,15 +2130,11 @@ def _hours_totals(dates):
         for r in (hist.get(iso) or {}).values():
             if r.get("seconds", 0) > 0:
                 tot[r["name"]] = tot.get(r["name"], 0.0) + r["seconds"] / 3600.0
-                cam[r["name"]] = cam.get(r["name"], 0.0) + r.get("camera_seconds", 0) / 3600.0
     if want_today:
         for rec in today.values():
             s = live_seconds(rec)
-            if s > 0:
-                tot[rec["name"]] = tot.get(rec["name"], 0.0) + s / 3600.0
-                cam[rec["name"]] = cam.get(rec["name"], 0.0) + live_camera(rec) / 3600.0
-    rows = [(n, h, (cam.get(n, 0.0) / h * 100) if h else 0.0) for n, h in tot.items()]
-    return sorted(rows, key=lambda r: (-r[1], r[0]))
+            if s > 0: tot[rec["name"]] = tot.get(rec["name"], 0.0) + s / 3600.0
+    return sorted(tot.items(), key=lambda kv: (-kv[1], kv[0]))
 
 def _hours_board_embed(kind):
     n = now_pt(); tdy = n.date()
@@ -2141,17 +2158,16 @@ def _hours_board_embed(kind):
     top = rows[0][1] if rows else 0.0
     medals = ["🥇", "🥈", "🥉"]
     lines = []
-    for i, (nm, h, cp) in enumerate(rows[:40]):
+    for i, (nm, h) in enumerate(rows[:40]):
         tag = medals[i] if i < 3 else f"`{i + 1:>2}.`"
-        camtxt = f" · 📷 {cp:.0f}%"
         if target > 0:
             star = " ⭐" if h > target else ""
-            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}{camtxt}")
+            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}")
         else:                                        # Sunday day-board: no schedule, plain hours
-            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**{camtxt}")
+            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**")
     body = f"*{sub}*\n\n" + ("\n".join(lines) if lines else "_No hours on the board yet._")
     e = discord.Embed(title=HOURS_BOARD_TITLES[kind], description=body, color=0xD4AF37)
-    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · 📷 = % of floor time on camera · "
+    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · "
                       f"⭐ = above & beyond · auto-updates · {n.strftime('%-I:%M %p')} PT")
     return e
 
@@ -2886,8 +2902,12 @@ async def on_ready():
     print(f"Logged in as {client.user}.")
     await cloud_pull_state()                       # restore history BEFORE anything reads it
     load_state()
+    global _state_ready
+    _state_ready = True                            # voice events may flow now — state is safe
     try: sync_current_voice()                      # pick up anyone already mid-session
     except Exception as e: print("voice rescan", e)
+    try: apply_recovery()                          # one-time Aug 3 hour restoration
+    except Exception as e: print("recovery", e)
     try: recheck_lates()                           # heal stale late flags after schedule changes
     except Exception as e: print("recheck lates", e)
     await ensure_start_message()
