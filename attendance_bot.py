@@ -1590,7 +1590,7 @@ async def refresh_lead_roi_board():
     state = await fetch_app_state()
     if not state: return
     mkey = _live_month_key(); label = _month_label(mkey)
-    prod = _submitted_ap_by_agent(state, mkey)                       # canonical tracker names
+    prod, _apps_r, _deals_r = await _live_prod(state, mkey)          # real-time, unsynced deals included
     totals = _agent_lead_totals(await fetch_lead_purchases(mkey))
     roster = [str(a) for a in (state.get("roster") or []) if str(a).lower() not in IP_EXCLUDE]
     if not roster: return
@@ -1701,8 +1701,7 @@ async def refresh_leaders_board():
     state = await fetch_app_state()
     if not state: return
     mkey = _live_month_key(); label = _month_label(mkey)
-    prod = _submitted_ap_by_agent(state, mkey)
-    chips = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
+    prod, _apps_l, deals_ct = await _live_prod(state, mkey)
     lead_tot = _agent_lead_totals(await fetch_lead_purchases(mkey))
     hours = {}
     for a in aggregate_month().values():
@@ -1730,7 +1729,7 @@ async def refresh_leaders_board():
         value=podium(spend, lambda n, v: f"**${int(round(v)):,}** on leads"
                      + (f" · {lead_tot[n]['leads']} leads" if n in lead_tot else "")), inline=False)
     e.add_field(name="💰 THE CLOSER — most business written",
-        value=podium(ap, lambda n, v: f"**${int(round(v)):,} AP** · {len(chips.get(n) or [])} deals"), inline=False)
+        value=podium(ap, lambda n, v: f"**${int(round(v)):,} AP** · {deals_ct.get(n, 0)} deals"), inline=False)
     e.set_footer(text="Month-to-date · hours = ALL Discord time · crowns = live Discord roles · EXCEL FINANCIAL")
     # the crowns ARE the roles — nobody manages them, they follow the board
     try:
@@ -1759,7 +1758,7 @@ async def post_formula_card():
     state = await fetch_app_state()
     if not state: return
     mkey = _live_month_key(); label = _month_label(mkey)
-    prod = _submitted_ap_by_agent(state, mkey)
+    prod, _apps_f, _deals_f = await _live_prod(state, mkey)
     lead_tot = _agent_lead_totals(await fetch_lead_purchases(mkey))
     hours_by_canon = {}
     for a in aggregate_month().values():
@@ -1939,6 +1938,38 @@ def _apps_by_agent(state, mkey):
         if v: out[str(a)] = v
     return out
 
+async def _live_prod(state, mkey):
+    """Canonical tracker chips PLUS any raw GroupMe deals the tracker hasn't synced
+       into app_state yet (deduped by chip deal-id) — boards are correct the second
+       a deal posts, whether or not anyone has opened the tracker today.
+       Returns (ap_map, apps_map, deal_count_map)."""
+    prod = dict(_submitted_ap_by_agent(state, mkey))
+    apps = dict(_apps_by_agent(state, mkey))
+    mdeals = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
+    deals_ct = {str(a): len(chips or []) for a, chips in mdeals.items()}
+    if mkey != _live_month_key():
+        return prod, apps, deals_ct                   # finished months: tracker is authoritative
+    try:
+        mstart = now_pt().replace(day=1, hour=0, minute=0, second=0,
+                                  microsecond=0).astimezone(dt.timezone.utc).isoformat()
+        raw = await fetch_deals_since(mstart)
+    except Exception as ex:
+        print("live prod merge", ex); return prod, apps, deals_ct
+    chip_ids = {str(d.get("id")) for chips in mdeals.values()
+                for d in (chips or []) if d.get("id") is not None}
+    merged = 0
+    for d in raw:
+        if str(d.get("id")) in chip_ids: continue     # tracker already counted it
+        ap = _num(d.get("ap"))
+        if ap <= 0: continue
+        nm = match_roster(state, d.get("agent")) or " ".join(str(d.get("agent") or "Unknown").split())
+        prod[nm] = prod.get(nm, 0.0) + ap
+        apps[nm] = apps.get(nm, 0) + max(int(_num(d.get("apps"))), 1)
+        deals_ct[nm] = deals_ct.get(nm, 0) + 1
+        merged += 1
+    if merged: print(f"live prod: merged {merged} unsynced deal(s)")
+    return prod, apps, deals_ct
+
 def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_map=None, mkey=None):
     metric = "IP" if kind == "ip" else "AP"
     team = _team_rollup(state, prod)
@@ -2026,11 +2057,10 @@ async def refresh_team_ap_board(mkey=None):
     state = await fetch_app_state()
     if not state: return
     mkey = mkey or _live_month_key(); label = _month_label(mkey)
-    prod = _submitted_ap_by_agent(state, mkey)   # canonical names from the tracker -> matches it exactly
-    mdeals = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
-    deal_count = sum(len(chips or []) for chips in mdeals.values())
+    prod, apps_map, deals_ct = await _live_prod(state, mkey)   # chips + unsynced raw deals
+    deal_count = sum(deals_ct.values())
     e = _team_board_embed(state, prod, label, kind="ap", deal_count=deal_count,
-                          apps_map=_apps_by_agent(state, mkey), mkey=mkey)
+                          apps_map=apps_map, mkey=mkey)
     if not e: return
     # Match THIS month's board only — when the month flips, last month's board stays
     # frozen as a permanent record and a fresh post starts the new month.
@@ -2051,9 +2081,9 @@ HOURS_BOARD_TITLES = {"day": "🕐 Hours — Today", "week": "🗓️ Hours — 
                       "month": "📆 Hours — This Month"}
 
 def _hours_totals(dates):
-    """[(name, hours)] across dates — history for finished days, live clocks for today."""
+    """[(name, hours, cam_pct)] across dates — history for finished days, live for today."""
     hist = load_json(HISTORY_FILE, {})
-    tk = today_key(); tot = {}
+    tk = today_key(); tot = {}; cam = {}
     want_today = False
     for d in dates:
         iso = d.isoformat()
@@ -2061,11 +2091,15 @@ def _hours_totals(dates):
         for r in (hist.get(iso) or {}).values():
             if r.get("seconds", 0) > 0:
                 tot[r["name"]] = tot.get(r["name"], 0.0) + r["seconds"] / 3600.0
+                cam[r["name"]] = cam.get(r["name"], 0.0) + r.get("camera_seconds", 0) / 3600.0
     if want_today:
         for rec in today.values():
             s = live_seconds(rec)
-            if s > 0: tot[rec["name"]] = tot.get(rec["name"], 0.0) + s / 3600.0
-    return sorted(tot.items(), key=lambda kv: (-kv[1], kv[0]))
+            if s > 0:
+                tot[rec["name"]] = tot.get(rec["name"], 0.0) + s / 3600.0
+                cam[rec["name"]] = cam.get(rec["name"], 0.0) + live_camera(rec) / 3600.0
+    rows = [(n, h, (cam.get(n, 0.0) / h * 100) if h else 0.0) for n, h in tot.items()]
+    return sorted(rows, key=lambda r: (-r[1], r[0]))
 
 def _hours_board_embed(kind):
     n = now_pt(); tdy = n.date()
@@ -2089,16 +2123,17 @@ def _hours_board_embed(kind):
     top = rows[0][1] if rows else 0.0
     medals = ["🥇", "🥈", "🥉"]
     lines = []
-    for i, (nm, h) in enumerate(rows[:40]):
+    for i, (nm, h, cp) in enumerate(rows[:40]):
         tag = medals[i] if i < 3 else f"`{i + 1:>2}.`"
+        camtxt = f" · 📷 {cp:.0f}%"
         if target > 0:
             star = " ⭐" if h > target else ""
-            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}")
+            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}{camtxt}")
         else:                                        # Sunday day-board: no schedule, plain hours
-            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**")
+            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**{camtxt}")
     body = f"*{sub}*\n\n" + ("\n".join(lines) if lines else "_No hours on the board yet._")
     e = discord.Embed(title=HOURS_BOARD_TITLES[kind], description=body, color=0xD4AF37)
-    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · "
+    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · 📷 = % of floor time on camera · "
                       f"⭐ = above & beyond · auto-updates · {n.strftime('%-I:%M %p')} PT")
     return e
 
@@ -2356,9 +2391,8 @@ async def cmd_mystats(interaction: discord.Interaction):
         canon = match_roster(state, name) if state else None
         if canon:
             mkey = _live_month_key()
-            prod = _submitted_ap_by_agent(state, mkey)
-            chips = ((state.get("months") or {}).get(mkey) or {}).get("deals") or {}
-            my_ap = prod.get(canon, 0); my_deals = len(chips.get(canon) or [])
+            prod, _apps_m, deals_ct = await _live_prod(state, mkey)
+            my_ap = prod.get(canon, 0); my_deals = deals_ct.get(canon, 0)
             lines.append(f"**{_month_label(mkey)}:** {my_deals} deals · **${int(round(my_ap)):,} AP**")
             ipv = _net_map(state, mkey).get(canon)
             if ipv: lines.append(f"**Issued IP:** ${int(round(ipv)):,}")
@@ -2398,10 +2432,11 @@ QUAD_KEY = [
     ("exit",  "DECISION TIME", "low hours, low AP — not showing, not writing"),
 ]
 
-def build_quadrant_points(state):
+def build_quadrant_points(state, prod=None):
     """{name: {h: month hours in rooms, ap: month submitted AP}} — owner excluded."""
     att = aggregate_month()
-    prod = _submitted_ap_by_agent(state, _live_month_key()) if state else {}
+    if prod is None:
+        prod = _submitted_ap_by_agent(state, _live_month_key()) if state else {}
     points = {}
     for a in att.values():
         nm = a["name"]; canon = (match_roster(state, nm) if state else None) or nm
@@ -2515,7 +2550,8 @@ async def post_quadrant():
     ch = client.get_channel(LOG_CHANNEL_ID)
     if not ch: return
     state = await fetch_app_state() if SUPABASE_KEY else None
-    points = build_quadrant_points(state)
+    prod_q, _a_q, _d_q = (await _live_prod(state, _live_month_key())) if state else ({}, {}, {})
+    points = build_quadrant_points(state, prod_q)
     if len(points) < 2: return
     buf = render_quadrant(points, _month_label(_live_month_key()))
     if not buf: return
@@ -2731,7 +2767,8 @@ async def cmd_attendance(interaction: discord.Interaction,
             if buf: return await interaction.followup.send(file=discord.File(buf, "week.png"), ephemeral=True)
         elif p == "quad":
             state = await fetch_app_state() if SUPABASE_KEY else None
-            points = build_quadrant_points(state)
+            prod_q, _a_q, _d_q = (await _live_prod(state, _live_month_key())) if state else ({}, {}, {})
+            points = build_quadrant_points(state, prod_q)
             if len(points) < 2: return await interaction.followup.send("Not enough data yet for the quadrant.", ephemeral=True)
             buf = render_quadrant(points, _month_label(_live_month_key()))
             if buf: return await interaction.followup.send(file=discord.File(buf, "quadrant.png"), ephemeral=True)
