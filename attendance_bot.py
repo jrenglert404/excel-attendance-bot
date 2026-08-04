@@ -1527,6 +1527,49 @@ def match_roster(state, name):
     if qf in firsts and len(firsts[qf]) == 1: return firsts[qf][0]
     return None
 
+def _parse_goal_amount(seg):
+    """'$100,000' · '15k' · '7.5k' · '10 k' · '1-2k' (top of range) -> dollars."""
+    m = re.match(r"\$?\s*([\d][\d,\.]*)\s*(?:-\s*\$?\s*([\d][\d,\.]*))?\s*(k)?", str(seg or "").strip(), re.I)
+    if not m: return 0
+    v = _num((m.group(2) or m.group(1)).replace(",", ""))
+    if m.group(3): v *= 1000
+    elif 0 < v < 200: v *= 1000            # "Goal: 15" on a sales floor means $15k
+    return int(round(v))
+
+def _parse_goal_post(text):
+    t = str(text or "")
+    def grab(pat):
+        m = re.search(pat, t, re.I)
+        return _parse_goal_amount(m.group(1)) if m else 0
+    return {"goal":   grab(r"goal[:\s]+([$\d][^\n;]*?)(?=\s*(?:commit|lead|spend|$|\n))"),
+            "commit": grab(r"commits?[:\s]+([$\d][^\n;]*?)(?=\s*(?:goal|lead|spend|$|\n))"),
+            "lead":   grab(r"lead\s*spends?[:\s]*([$\d][^\n;]*?)(?=\s*(?:goal|commit|$|\n))")
+                      or grab(r"spends?[:\s]+([$\d][^\n;]*?)(?=\s*(?:goal|commit|$|\n))")}
+
+async def fetch_goalpost_targets(state, mkey):
+    """READ-ONLY: latest GroupMe goal post per rep this month -> {canon: {goal, commit, lead}}.
+       Display fallback only (the tracker imports these for real on its next sync)."""
+    url = f"{SUPABASE_URL}/rest/v1/goal_posts"
+    headers = {"apikey": SUPABASE_KEY, "authorization": f"Bearer {SUPABASE_KEY}"}
+    params = {"select": "name,text,posted_at", "posted_at": f"gte.{mkey}-01", "order": "posted_at.asc"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params=params, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200: return {}
+                posts = await r.json() or []
+    except Exception as ex:
+        print("goalpost fetch", ex); return {}
+    out = {}
+    for p in posts:                                       # ascending: latest wins per field
+        canon = match_roster(state, p.get("name"))
+        if not canon: continue
+        vals = _parse_goal_post(p.get("text"))
+        slot = out.setdefault(canon, {"goal": 0, "commit": 0, "lead": 0})
+        for k in ("goal", "commit", "lead"):
+            if vals[k]: slot[k] = vals[k]
+    return out
+
 async def fetch_lead_purchases(month):
     """Every lead-order row logged this month (append-only)."""
     url = f"{SUPABASE_URL}/rest/v1/{LEAD_TABLE}"
@@ -2535,6 +2578,11 @@ async def cmd_mystats(interaction: discord.Interaction):
             mblob = ((state.get("months") or {}).get(mkey) or {})
             my_commit = float((mblob.get("commits") or {}).get(canon) or 0)
             my_goal   = float((mblob.get("goals") or {}).get(canon) or 0)
+            gp = {}
+            if not my_commit or not my_goal:              # tracker empty -> their own GroupMe post
+                gp = (await fetch_goalpost_targets(state, mkey)).get(canon) or {}
+                my_commit = my_commit or float(gp.get("commit") or 0)
+                my_goal   = my_goal   or float(gp.get("goal") or 0)
             if my_commit:
                 lines.append(f"🎯 **Commit:** {_goal_line(my_ap, my_commit)}")
             if my_goal:
@@ -2542,7 +2590,7 @@ async def cmd_mystats(interaction: discord.Interaction):
             if not my_commit and not my_goal:
                 lines.append("_No commit or goal set for this month — enter them in the tracker._")
             # --- lead spend vs lead commit --------------------------------------
-            lead_commit = float((mblob.get("leadCommits") or {}).get(canon) or 0)
+            lead_commit = float((mblob.get("leadCommits") or {}).get(canon) or 0) or float((gp or {}).get("lead") or 0)
             t = _agent_lead_totals(await fetch_lead_purchases(mkey)).get(canon)
             spend = t["spend"] if t else float((mblob.get("leadSpends") or {}).get(canon) or 0)
             if spend or lead_commit:
