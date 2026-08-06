@@ -779,48 +779,6 @@ def build_daily_rows():
     rows.sort(key=lambda r: (r["status"] == "noshow", -r["hours"]))   # most IN on top, no-shows last
     return rows
 
-DAILY_TEXT_TIME = dt.time(22, 0)   # 10 PM PT — end-of-day text recap in #attendance-log
-
-async def post_daily_text_report():
-    """10 PM PT recap — plain text, easiest to digest. One line per person: first entry,
-       final exit, total hours vs expected for the day, camera %. Most hours on top,
-       no-shows at the bottom. By 10 PM the evening grinders are counted too."""
-    ch = client.get_channel(LOG_CHANNEL_ID)
-    if not ch: return
-    ensure_today(); recheck_lates()
-    n = now_pt()
-    target = scheduled_day_hours(n.date())
-    rows = []
-    for rec in today.values():
-        h = live_seconds(rec) / 3600.0
-        cam = camera_pct(rec) * 100
-        first_in = fmt(rec.get("first_join"))
-        last_out = "in room" if rec.get("present") else fmt(rec.get("last_leave"))
-        rows.append((rec["name"], first_in, last_out, h, cam))
-    rows.sort(key=lambda r: -r[3])
-    noshows = []
-    guild = client.get_guild(GUILD_ID)
-    if guild and scheduled_start_today() is not None:
-        role = guild.get_role(VERIFIED_ROLE_ID)
-        if role:
-            noshows = sorted(m.display_name for m in role.members
-                             if not m.bot and str(m.id) not in today)
-    if not rows and not noshows: return
-    head = f"{'Rep':<14}{'In':>9}{'Out':>9}{'Hours':>10}{'Cam':>5}"
-    L = [head, "─" * len(head)]
-    for nm, fi, lo, h, cam in rows:
-        hrs = f"{h:.1f}/{target:g}" if target else f"{h:.1f}h"
-        star = "⭐" if target and h > target else " "
-        L.append(f"{_short_name(nm, 13):<14}{fi:>9}{lo:>9}{hrs:>9}{star}{cam:>4.0f}%")
-    body = "```\n" + "\n".join(L) + "\n```"
-    if noshows:
-        body += f"🚫 **No-shows ({len(noshows)}):** " + ", ".join(noshows)
-    e = discord.Embed(title=f"🌙 Day Recap — {n.strftime('%A, %B %-d')}",
-        description=body, color=0x5865F2)
-    e.set_footer(text="In = first entry · Out = final exit · Hours = ALL Discord time vs scheduled "
-                      "(⭐ over) · Cam = % of floor time on camera · most hours on top")
-    try: await ch.send(embed=e)
-    except Exception as ex: print("daily text", ex)
 
 async def close_out_day():
     """6 PM close: judge the day (late/early/away/no-shows) into history and flag repeat
@@ -2793,37 +2751,6 @@ async def post_builder_roll():
     try: await ch.send(embed=e)
     except Exception as ex: print("builder roll", ex)
 
-async def check_sync_sentinel():
-    """Daily: warn the owner once if the data pipes look broken (stale deals / dead tracker)."""
-    if not SUPABASE_KEY: return
-    ch = client.get_channel(LOG_CHANNEL_ID)
-    guild = client.get_guild(GUILD_ID)
-    if not ch: return
-    problems = []
-    try:
-        deals = await fetch_recent_deals(1)
-        newest = (deals[0].get("posted_at") if deals else None)
-        if newest:
-            age_h = (dt.datetime.now(dt.timezone.utc)
-                     - dt.datetime.fromisoformat(str(newest).replace("Z", "+00:00"))).total_seconds() / 3600
-            if age_h > SENTINEL_STALE_HRS:
-                problems.append(f"no new deals in **{age_h:.0f}h** — tracker→Discord deal sync may be broken")
-        elif not deals:
-            problems.append("deals table returned nothing")
-    except Exception:
-        problems.append("can't reach the deals table")
-    try:
-        if not await fetch_app_state():
-            problems.append("can't read the tracker's app_state (roster/hierarchy/IP source)")
-    except Exception:
-        problems.append("app_state fetch is erroring")
-    if not problems: return
-    owner = f"<@{guild.owner_id}> " if guild and guild.owner_id else ""
-    e = discord.Embed(title="🩺 Sync Sentinel — data pipe warning",
-        description="\n".join("• " + p for p in problems), color=0xC0392B)
-    e.set_footer(text="Checked daily at the 6 PM report · fix = check Supabase keys / tracker sync")
-    try: await ch.send(content=owner.strip() or None, embed=e)
-    except Exception as ex: print("sentinel", ex)
 
 @tree.command(name="export", description="Owner: download this month's attendance + deals as CSV",
               guild=discord.Object(GUILD_ID))
@@ -3039,7 +2966,6 @@ async def post_ntg_report():
 
 # ---- scheduler ------------------------------------------------------------
 _last_daily = None
-_last_daily_text = None
 _last_weekly = None
 _last_team_ip = None
 _last_monthly = None
@@ -3101,11 +3027,6 @@ async def scheduler():
         _last_builder = n.date(); await post_builder_roll()
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
         _last_daily = n.date(); await close_out_day()   # silent close: flags -> history, no card posted
-        await check_sync_sentinel()            # data-pipe health check, once a day
-    # 10 PM PT — end-of-day text recap (first in / last out / hours vs expected / cam %)
-    global _last_daily_text
-    if n.time() >= DAILY_TEXT_TIME and _last_daily_text != n.date() and scheduled_start_today() is not None:
-        _last_daily_text = n.date(); await post_daily_text_report()
     # 9 PM PT — daily deals total in #deals (late closes counted)
     global _last_deals_daily
     if n.time() >= DEALS_DAILY_TIME and _last_deals_daily != n.date() and scheduled_start_today() is not None:
