@@ -2081,8 +2081,18 @@ async def _live_prod(state, mkey):
     if merged: print(f"live prod: merged {merged} unsynced deal(s)")
     return prod, apps, deals_ct
 
-def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_map=None, mkey=None):
+def _team_board_embed(state, prod, month_label, *, kind, deal_count=None, apps_map=None, mkey=None,
+                      roster_only=False):
     metric = "IP" if kind == "ip" else "AP"
+    if roster_only:
+        # Active roster (tracker's Overrides tab) — BUT a retired agent who wrote business
+        # this month keeps their spot: production earned is production shown. Only
+        # off-roster names with NOTHING on the board are dropped.
+        rlow = {str(x).strip().lower() for x in (state.get("roster") or [])}
+        prod = {k: v for k, v in prod.items()
+                if str(k).strip().lower() in rlow or float(v or 0) > 0}
+        apps_map = {k: v for k, v in (apps_map or {}).items()
+                    if str(k).strip().lower() in rlow or k in prod}
     team = _team_rollup(state, prod)
     apps_map = apps_map or {}
     team_apps = _team_rollup(state, apps_map) if apps_map else {}
@@ -2171,7 +2181,8 @@ async def refresh_team_ap_board(mkey=None):
     prod, apps_map, deals_ct = await _live_prod(state, mkey)   # chips + unsynced raw deals
     deal_count = sum(deals_ct.values())
     e = _team_board_embed(state, prod, label, kind="ap", deal_count=deal_count,
-                          apps_map=apps_map, mkey=mkey)
+                          apps_map=apps_map, mkey=mkey,
+                          roster_only=(mkey == _live_month_key()))   # current month: active roster only
     if not e: return
     # Match THIS month's board only — when the month flips, last month's board stays
     # frozen as a permanent record and a fresh post starts the new month.
