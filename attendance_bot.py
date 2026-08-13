@@ -2049,6 +2049,42 @@ def _apps_by_agent(state, mkey):
         if v: out[str(a)] = v
     return out
 
+# Money attribution must be STRICT. The fuzzy nickname matcher (fine for attendance)
+# once credited "Michael Delpino" deals to Michael Karis on first-name alone. Rules:
+# exact name, else same last name + compatible first name (Michael≈Mike, Joshua≈Josh...).
+# No confident match -> the deal shows under its RAW GroupMe name instead of being
+# guessed onto the wrong rep, and self-corrects to canonical on the next tracker sync.
+_NICKNAMES = {"michael": "mike", "mike": "mike", "joshua": "josh", "josh": "josh",
+              "stephen": "steve", "steve": "steve", "steven": "steve",
+              "christopher": "chris", "chris": "chris", "jonathan": "jon", "jon": "jon",
+              "matthew": "matt", "matt": "matt", "daniel": "dan", "dan": "dan",
+              "william": "will", "will": "will", "robert": "rob", "rob": "rob",
+              "alexander": "alex", "alex": "alex", "nicholas": "nick", "nick": "nick",
+              "anthony": "tony", "tony": "tony", "joseph": "joe", "joe": "joe"}
+
+def _first_norm(word):
+    w = str(word or "").strip().lower()
+    return _NICKNAMES.get(w, w)
+
+def _match_deal_agent(state, name):
+    """Strict roster match for deal credit — exact, else last name + compatible first."""
+    q = " ".join(str(name or "").split()).strip().lower()
+    if not q: return None
+    roster = [str(r) for r in (state.get("roster") or [])]
+    for r in roster:
+        if " ".join(r.split()).strip().lower() == q: return r
+    qp = q.split()
+    if len(qp) >= 2:
+        cands = [r for r in roster
+                 if r.lower().split()[-1] == qp[-1]
+                 and _first_norm(r.split()[0]) == _first_norm(qp[0])]
+        if len(cands) == 1: return cands[0]
+    else:                                              # single word: unique exact first OR last name
+        cands = [r for r in roster
+                 if _first_norm(r.split()[0]) == _first_norm(qp[0]) or r.lower().split()[-1] == qp[0]]
+        if len(cands) == 1: return cands[0]
+    return None
+
 async def _live_prod(state, mkey):
     """Canonical tracker chips PLUS any raw GroupMe deals the tracker hasn't synced
        into app_state yet (deduped by chip deal-id) — boards are correct the second
@@ -2073,7 +2109,7 @@ async def _live_prod(state, mkey):
         if str(d.get("id")) in chip_ids: continue     # tracker already counted it
         ap = _num(d.get("ap"))
         if ap <= 0: continue
-        nm = match_roster(state, d.get("agent")) or " ".join(str(d.get("agent") or "Unknown").split())
+        nm = _match_deal_agent(state, d.get("agent")) or " ".join(str(d.get("agent") or "Unknown").split())
         prod[nm] = prod.get(nm, 0.0) + ap
         apps[nm] = apps.get(nm, 0) + max(int(_num(d.get("apps"))), 1)
         deals_ct[nm] = deals_ct.get(nm, 0) + 1
