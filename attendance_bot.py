@@ -2667,10 +2667,14 @@ def render_quadrant(points, month_label):
     med_h = _median(hs); med_ap = _median(aps)
     x0, y0, x1, y1 = PLOT
     mx = (x0 + x1) / 2; my = (y0 + y1) / 2               # equal squares, always
+    def _is_high(v, med):
+        """High half = strictly above median, or tied with a NONZERO median. A $0 month
+           can never count as 'high AP' — that bug emptied two quadrants early-month."""
+        return v > med or (v >= med and med > 0)
     def _fractions(vals_by_name, med):
         """{name: 0..1} — below-median names spread across [0,.5), rest across [.5,1]."""
-        lows  = sorted([nm for nm, v in vals_by_name.items() if v <  med], key=lambda n: (vals_by_name[n], n))
-        highs = sorted([nm for nm, v in vals_by_name.items() if v >= med], key=lambda n: (vals_by_name[n], n))
+        lows  = sorted([nm for nm, v in vals_by_name.items() if not _is_high(v, med)], key=lambda n: (vals_by_name[n], n))
+        highs = sorted([nm for nm, v in vals_by_name.items() if _is_high(v, med)], key=lambda n: (vals_by_name[n], n))
         out = {}
         for i, nm in enumerate(lows):  out[nm] = ((i + 0.5) / max(len(lows), 1)) * 0.46 + 0.02
         for i, nm in enumerate(highs): out[nm] = 0.52 + ((i + 0.5) / max(len(highs), 1)) * 0.46
@@ -2697,12 +2701,13 @@ def render_quadrant(points, month_label):
     for nm, p in sorted(points.items(), key=lambda kv: -kv[1]["ap"]):
         hx = x0 + fx[nm] * (x1 - x0)
         hy = y1 - fy[nm] * (y1 - y0)
-        key = ("core" if p["h"] >= med_h and p["ap"] >= med_ap else
-               "wild" if p["ap"] >= med_ap else
-               "coach" if p["h"] >= med_h else "exit")
+        hi_h, hi_ap = _is_high(p["h"], med_h), _is_high(p["ap"], med_ap)
+        key = ("core" if hi_h and hi_ap else
+               "wild" if hi_ap else
+               "coach" if hi_h else "exit")
         col = QUAD_COLORS[key]
         d.ellipse([hx - 7, hy - 7, hx + 7, hy + 7], fill=col, outline=CARD_BLACK)
-        name = nm.split()[0][:11]
+        name = nm[:18]                                # FULL display name, not just first
         val = f"{p['h']:.0f}h · {_fmt_money(p['ap'])}"
         w = max(d.textlength(name, font=nf), d.textlength(val, font=vf))
         lx = hx + 11 if hx < x1 - (w + 20) else hx - 11 - w
