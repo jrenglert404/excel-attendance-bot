@@ -100,6 +100,7 @@ EXCLUDE_NAME_CONTAINS     = ["join to create"]
 EXCLUDE_CATEGORY_CONTAINS = ["statdock"]
 STATE_FILE   = "attendance_state.json"
 HISTORY_FILE = "attendance_history.json"
+SCHED_STATE_FILE = "sched_state.json"   # last-fire markers for scheduled posts (survive redeploys)
 
 # --- Wins feed: auto-post new sales from the Supabase deals table to #wins ---
 WINS_CHANNEL_ID = 1531689406832836719           # #deals
@@ -247,6 +248,8 @@ tree = discord.app_commands.CommandTree(client)
 
 today = {}
 current_day = None
+late_pinged = set()      # member ids already LATE-pinged today — idempotency guard so a
+                         # gateway re-dispatch / reconnect / overlapping deploy can't double-ping
 
 
 def now_pt():           return dt.datetime.now(PACIFIC)
@@ -315,13 +318,14 @@ def save_json(p, d):
     except RuntimeError:
         pass                                        # no loop yet (startup) — cloud copy comes next save
 
-def save_state(): save_json(STATE_FILE, {"day": current_day, "today": today})
+def save_state(): save_json(STATE_FILE, {"day": current_day, "today": today, "late_pinged": sorted(late_pinged)})
 
 def load_state():
-    global today, current_day
+    global today, current_day, late_pinged
     data = load_json(STATE_FILE, {})
     if data.get("day") == today_key():
         current_day = data["day"]; today = data["today"]
+        late_pinged = set(data.get("late_pinged", []))
 
 def is_work_channel(ch):
     if ch is None: return False
@@ -369,10 +373,10 @@ def _freeze_day(day_iso, records):
     hist[day_iso] = snap; save_json(HISTORY_FILE, hist)
 
 def ensure_today():
-    global today, current_day
+    global today, current_day, late_pinged
     if current_day != today_key():
         old_day, old = current_day, today
-        current_day = today_key(); today = {}
+        current_day = today_key(); today = {}; late_pinged = set()
         if old_day and old:
             _freeze_day(old_day, old)                     # finished day -> history, in full
             ts = now_pt().isoformat()                     # carry over anyone in a room at midnight
@@ -464,7 +468,12 @@ async def on_voice_state_update(member, before, after):
                    "present": True, "late": late, "camera_on": False, "cam_ts": None,
                    "camera_seconds": 0.0}
             today[mid] = rec
-            await announce_arrival(member, ts, late, start)
+            if late:
+                if mid not in late_pinged:                # ping each late arrival ONCE per day
+                    late_pinged.add(mid); save_state()    # persist guard BEFORE the send so a
+                    await announce_arrival(member, ts, late, start)   # replay/2nd instance can't repeat it
+            else:
+                await announce_arrival(member, ts, late, start)
         else:
             rec["present"] = True; rec["last_leave"] = None
             if not rec.get("enter_ts"): rec["enter_ts"] = ts.isoformat()
@@ -1471,7 +1480,7 @@ def _kfmt(v):
 
 def match_roster(state, name):
     """Best-effort map a typed name to a canonical roster name."""
-    roster = list(state.get("roster") or [])
+    roster = [str(r) for r in (state.get("roster") or []) if str(r).strip()]
     q = " ".join(str(name or "").split()).strip().lower()
     if not q: return None
     low = {r.lower(): r for r in roster}
@@ -2070,7 +2079,7 @@ def _match_deal_agent(state, name):
     """Strict roster match for deal credit — exact, else last name + compatible first."""
     q = " ".join(str(name or "").split()).strip().lower()
     if not q: return None
-    roster = [str(r) for r in (state.get("roster") or [])]
+    roster = [str(r) for r in (state.get("roster") or []) if str(r).strip()]
     for r in roster:
         if " ".join(r.split()).strip().lower() == q: return r
     qp = q.split()
@@ -3024,11 +3033,34 @@ _last_monthly = None
 _last_builder = None
 _last_deals_daily = None
 
+def _sched_date(v):
+    try: return dt.date.fromisoformat(v) if v else None
+    except Exception: return None
+
+def load_sched_state():
+    """Restore last-fire markers so a same-day restart doesn't re-post the daily close,
+       the 9 PM deals total, the builder roll, or the Sunday wrap + everyone's DM cards."""
+    global _last_daily, _last_weekly, _last_monthly, _last_builder, _last_deals_daily
+    d = load_json(SCHED_STATE_FILE, {})
+    _last_daily       = _sched_date(d.get("daily"))
+    _last_weekly      = _sched_date(d.get("weekly"))
+    _last_builder     = _sched_date(d.get("builder"))
+    _last_deals_daily = _sched_date(d.get("deals_daily"))
+    m = d.get("monthly")
+    _last_monthly = tuple(m) if isinstance(m, list) and len(m) == 2 else None
+
+def save_sched_state():
+    def _s(x): return x.isoformat() if x else None
+    save_json(SCHED_STATE_FILE, {"daily": _s(_last_daily), "weekly": _s(_last_weekly),
+                                 "builder": _s(_last_builder), "deals_daily": _s(_last_deals_daily),
+                                 "monthly": list(_last_monthly) if _last_monthly else None})
+
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}.")
     await cloud_pull_state()                       # restore history BEFORE anything reads it
     load_state()
+    load_sched_state()                             # restore scheduled-post fire markers
     global _state_ready
     _state_ready = True                            # voice events may flow now — state is safe
     try: sync_current_voice()                      # pick up anyone already mid-session
@@ -3066,33 +3098,41 @@ async def on_ready():
 
 @tasks.loop(seconds=30)
 async def scheduler():
-    global _last_daily, _last_weekly, _last_monthly
-    n = now_pt(); ensure_today()
+    global _last_daily, _last_weekly, _last_monthly, _last_builder, _last_deals_daily
+    try:
+        n = now_pt(); ensure_today()
+    except Exception as e:
+        print("scheduler tick", e); return
     # 1st of the month, 10 AM PT — team IP board + trend chart + NTG quality report
     if SUPABASE_KEY and n.day == MONTHLY_REPORT_DAY and n.time() >= MONTHLY_TIME and _last_monthly != (n.year, n.month):
-        _last_monthly = (n.year, n.month)
-        await post_team_ip_monthly(); await post_ntg_report()
-        await post_persistency_watch()
+        _last_monthly = (n.year, n.month); save_sched_state()
+        try:
+            await post_team_ip_monthly(); await post_ntg_report()
+            await post_persistency_watch()
+        except Exception as e: print("monthly posts", e)
     # Saturday 2:10 PM — builder call roll
-    global _last_builder
     if n.weekday() == BUILDER_DAY and n.time() >= BUILDER_CHECK and _last_builder != n.date():
-        _last_builder = n.date(); await post_builder_roll()
+        _last_builder = n.date(); save_sched_state()
+        try: await post_builder_roll()
+        except Exception as e: print("builder roll", e)
     if end_today() and n.time() >= end_today() and _last_daily != n.date() and scheduled_start_today() is not None:
-        _last_daily = n.date(); await close_out_day()   # silent close: flags -> history, no card posted
+        _last_daily = n.date(); save_sched_state()
+        try: await close_out_day()   # silent close: flags -> history, no card posted
+        except Exception as e: print("close out", e)
     # 9 PM PT — daily deals total in #deals (late closes counted)
-    global _last_deals_daily
     if n.time() >= DEALS_DAILY_TIME and _last_deals_daily != n.date() and scheduled_start_today() is not None:
-        _last_deals_daily = n.date(); await post_deals_daily()
+        _last_deals_daily = n.date(); save_sched_state()
+        try: await post_deals_daily()
+        except Exception as e: print("deals daily", e)
     # Sunday 6 PM PT — the wrap (recognition + streak/PB recap + rank roles) and weekly boards
     if n.weekday() == WEEKLY_DAY and n.time() >= WEEKLY_TIME and _last_weekly != n.date():
-        _last_weekly = n.date()
-        await post_sunday_wrap()       # ONE public wrap + private accountability + roles
-        await send_report_cards()      # every rep's private DM report card
-        await post_quadrant()          # hours-vs-production quadrant (owner + trainers)
-        await refresh_lead_roi_board() # keep the live ROI board fresh
-        await post_formula_card()      # top producers vs hours & lead spend (#team-production)
-        await post_lead_report()       # lead-buying breakdown (owner-only)
-        await refresh_team_ap_board()  # keep the live manager board fresh
+        _last_weekly = n.date(); save_sched_state()
+        for label, coro in (("sunday wrap", post_sunday_wrap), ("report cards", send_report_cards),
+                            ("quadrant", post_quadrant), ("roi board", refresh_lead_roi_board),
+                            ("formula card", post_formula_card), ("lead report", post_lead_report),
+                            ("team board", refresh_team_ap_board)):
+            try: await coro()
+            except Exception as e: print(label, e)
     # IP Reports are import-driven (see ip_poller) — no fixed weekly/monthly schedule.
 
 
