@@ -140,6 +140,11 @@ LEAD_TABLE        = "lead_purchases"       # Supabase append-only log (see setup
 #     issued-IP team board posts at month end. ---
 TEAM_CH_ID = 1531861880824402000           # #team-production
 HOURS_CH_ID = 1533183714371305593          # #hours — live day/week/month hour boards (read-only)
+HISTORY_CH_NAME = "history"                # #history — OWNER-ONLY archive: monthly (Final) cards,
+                                           #   All-Time hours + All-Time production. Auto-created
+                                           #   under the Admins category if missing; adopted by name.
+HISTORY_CATEGORY_ID = 1530612428545724416  # ✦════・Admins
+OWNER_USER_ID = 1149691453640020108        # Jesse — the only human who can see #history
 
 # --- Rank roles: auto-awarded at the Sunday Wrap (and Top IP on the Final MTD drop) ---
 ROLE_CLOSER   = 1531874671220494416   # 💰 The Closer — most business written (auto-synced to the crown board)
@@ -2365,12 +2370,57 @@ async def refresh_hours_boards():
                 except Exception: pass
             except Exception as ex: print("hours send", ex)
 
-# ---- end-of-month hours archive ------------------------------------------------
-# When a month finishes, its hours board would otherwise reset to the new month. Each
-# finished month is posted ONCE as a permanent "(Final)" card in #hours (with that
-# month's production), so no month is ever lost. Self-healing: any finished month found
-# in history that hasn't been archived yet gets posted, oldest first.
+# ---- #history: owner-only archive tab ------------------------------------------
+# Holds (1) every finished month's "(Final)" hours card with that month's production,
+# (2) a live "All Time" hours board, (3) a live "All Time" production board.
+# The channel is auto-created under the Admins category (owner + bot only) and
+# adopted by name if it already exists. Live day/week/month boards stay in #hours.
+_history_ch_id = None
 _hours_archived = set()
+
+def _is_history_name(name):
+    """'history', '🗄┃history', '🗄history' all match; 'deal-history' does not."""
+    return "".join(c for c in str(name).lower() if c.isalpha()) == HISTORY_CH_NAME.lower()
+
+async def ensure_history_channel():
+    """Resolve (or create) the owner-only #history channel. Safe to call every boot."""
+    global _history_ch_id
+    guild = client.get_guild(GUILD_ID)
+    if not guild: return None
+    for ch in guild.text_channels:                       # adopt by name (emoji prefixes ok)
+        if _is_history_name(ch.name):
+            _history_ch_id = ch.id; return ch
+    try:
+        cat = guild.get_channel(HISTORY_CATEGORY_ID)
+        owner = guild.get_member(OWNER_USER_ID)
+        ows = {guild.default_role: discord.PermissionOverwrite(view_channel=False),
+               guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                     embed_links=True, attach_files=True,
+                                                     manage_messages=True, read_message_history=True)}
+        if owner:
+            ows[owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                     read_message_history=True)
+        ch = await guild.create_text_channel(f"🗄┃{HISTORY_CH_NAME}", category=cat, overwrites=ows,
+                                             reason="Owner-only hours/production history")
+        _history_ch_id = ch.id
+        print(f"history channel created: {ch.name} ({ch.id})"); return ch
+    except Exception as ex:
+        print("history channel create", ex, "— create a text channel named 'history' and the bot will adopt it")
+        return None
+
+def _history_channel():
+    """The #history channel. If it wasn't resolved at boot (e.g. created by hand later),
+       adopt it by name on the fly — no restart needed."""
+    global _history_ch_id
+    if _history_ch_id:
+        ch = client.get_channel(_history_ch_id)
+        if ch: return ch
+    guild = client.get_guild(GUILD_ID)
+    if not guild: return None
+    for ch in guild.text_channels:
+        if _is_history_name(ch.name):
+            _history_ch_id = ch.id; return ch
+    return None
 
 def _finished_months_in_history():
     hist = load_json(HISTORY_FILE, {})
@@ -2378,7 +2428,7 @@ def _finished_months_in_history():
     return sorted({k[:7] for k in hist if len(k) >= 7 and k[:7] < cur})
 
 async def archive_month_hours(mkey):
-    ch = client.get_channel(HOURS_CH_ID)
+    ch = _history_channel()
     if not ch: return False
     y, m = int(mkey[:4]), int(mkey[5:7])
     ap_of = None
@@ -2396,10 +2446,11 @@ async def archive_month_hours(mkey):
         print("archive month", mkey, ex); return False
 
 async def archive_finished_months():
-    """Post any finished month not yet archived. Runs from the scheduler after 12:10 AM so
-       the midnight freeze of the last day has landed. Persists what's been posted.
-       Returns True when nothing is left pending."""
+    """Post any finished month not yet archived to #history. Runs from the scheduler after
+       12:10 AM so the midnight freeze of the last day has landed. Persists what's been
+       posted. Returns True when nothing is left pending."""
     global _hours_archived
+    if not _history_channel(): return False
     pending = False
     for mkey in _finished_months_in_history():
         if mkey in _hours_archived: continue
@@ -2410,6 +2461,121 @@ async def archive_finished_months():
     return not pending
 
 _archive_checked_for = None     # live month key once every finished month is archived
+
+# ---- All-Time boards (live, edited in place in #history) -------------------------
+ALLTIME_TITLES = {"hours": "⏳ Hours — All Time", "prod": "💰 Production — All Time"}
+
+def _all_time_dates():
+    hist = load_json(HISTORY_FILE, {})
+    out = []
+    for k in hist:
+        try: out.append(dt.date.fromisoformat(k))
+        except Exception: pass
+    out.append(now_pt().date())                           # today's live clocks count too
+    return sorted(set(out))
+
+async def _all_time_prod(state):
+    """name -> (AP, apps) summed over EVERY month the tracker knows about; the live month
+       also merges unsynced raw deals so it's correct the moment a deal posts."""
+    ap, apps = {}, {}
+    live = _live_month_key()
+    for mkey in sorted((state.get("months") or {}).keys()):
+        if mkey == live:
+            p, a, _d = await _live_prod(state, mkey)
+        else:
+            p, a = _submitted_ap_by_agent(state, mkey), _apps_by_agent(state, mkey)
+        for k, v in p.items(): ap[k] = ap.get(k, 0.0) + float(v or 0)
+        for k, v in a.items(): apps[k] = apps.get(k, 0) + int(v or 0)
+    if live not in (state.get("months") or {}):           # tracker hasn't opened this month yet
+        try:
+            p, a, _d = await _live_prod(state, live)
+            for k, v in p.items(): ap[k] = ap.get(k, 0.0) + float(v or 0)
+            for k, v in a.items(): apps[k] = apps.get(k, 0) + int(v or 0)
+        except Exception as ex: print("all-time live month", ex)
+    return ap, apps
+
+def _all_time_hours_embed(ap_of=None):
+    rows = _hours_totals(_all_time_dates())              # same hour math as every other board
+    top = rows[0][1] if rows else 0.0
+    medals = ["🥇", "🥈", "🥉"]; lines = []
+    for i, (nm, h, cp) in enumerate(rows[:40]):
+        tag = medals[i] if i < 3 else f"`{i + 1:>2}.`"
+        aptxt = ""
+        if ap_of is not None:
+            try: aptxt = f" · 💰 {_fmt_money(float(ap_of(nm) or 0))}"
+            except Exception: aptxt = ""
+        lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:,.1f}h** · 📷 {cp:.0f}%{aptxt}")
+    first = _all_time_dates()[0] if _all_time_dates() else now_pt().date()
+    body = f"*Since {first.strftime('%b %-d, %Y')}*\n\n" + ("\n".join(lines) if lines else "_Nothing yet._")
+    e = discord.Embed(title=ALLTIME_TITLES["hours"], description=body, color=0xD4AF37)
+    e.set_footer(text="ALL Discord voice time ever recorded (24/7, AFK not counted) · 📷 % on camera · "
+                      f"💰 all-time submitted AP · auto-updates · {now_pt().strftime('%-I:%M %p')} PT")
+    return e
+
+def _all_time_prod_embed(ap, apps):
+    rows = sorted(((n, float(v or 0), int(apps.get(n, 0))) for n, v in ap.items() if float(v or 0) > 0),
+                  key=lambda r: (-r[1], r[0]))
+    top = rows[0][1] if rows else 0.0
+    medals = ["🥇", "🥈", "🥉"]; lines = []
+    for i, (nm, v, n_apps) in enumerate(rows[:40]):
+        tag = medals[i] if i < 3 else f"`{i + 1:>2}.`"
+        lines.append(f"{tag} **{nm}** — `{bar(v / top if top else 0, 10)}` **${v:,.0f}** · {n_apps} apps")
+    total = sum(r[1] for r in rows); total_apps = sum(r[2] for r in rows)
+    body = f"*Every month on record · **${total:,.0f}** AP · **{total_apps}** apps*\n\n" + \
+           ("\n".join(lines) if lines else "_Nothing yet._")
+    e = discord.Embed(title=ALLTIME_TITLES["prod"], description=body, color=0x2ECC71)
+    e.set_footer(text=f"Submitted AP, all months combined (live month includes unsynced deals) · auto-updates · {now_pt().strftime('%-I:%M %p')} PT")
+    return e
+
+async def refresh_history_boards():
+    """Keep the two All-Time boards current in #history (edit in place; post once)."""
+    ch = _history_channel()
+    if not ch: return
+    ap_of, ap, apps = None, {}, {}
+    if SUPABASE_KEY:
+        try:
+            state = await fetch_app_state()
+            if state:
+                ap, apps = await _all_time_prod(state)
+                ap_of = _month_ap_lookup(state, ap)
+        except Exception as ex: print("all-time prod", ex)
+    want = {ALLTIME_TITLES["hours"]: _all_time_hours_embed(ap_of),
+            ALLTIME_TITLES["prod"]: _all_time_prod_embed(ap, apps)}
+    found = set()
+    async for m in ch.history(limit=100):
+        if m.author == client.user and m.embeds:
+            t = m.embeds[0].title or ""
+            if t in want and t not in found:
+                found.add(t)
+                try: await m.edit(embed=want[t])
+                except Exception as ex: print("history edit", ex)
+    for key in ("hours", "prod"):
+        t = ALLTIME_TITLES[key]
+        if t not in found:
+            try:
+                msg = await ch.send(embed=want[t])
+                try: await msg.pin()
+                except Exception: pass
+            except Exception as ex: print("history send", ex)
+
+async def sweep_finals_from_hours():
+    """#hours is for the LIVE boards only. Any '(Final)' month card there (posted before
+       #history existed) is removed once its copy lives in #history."""
+    ch = client.get_channel(HOURS_CH_ID)
+    if not ch or not _history_channel(): return
+    try:
+        async for m in ch.history(limit=100):
+            if m.author == client.user and m.embeds:
+                t = m.embeds[0].title or ""
+                if t.startswith("📆 Hours — ") and t.endswith("(Final)"):
+                    mk = None
+                    try:
+                        mk = dt.datetime.strptime(t[len("📆 Hours — "):-len(" (Final)")], "%B %Y").strftime("%Y-%m")
+                    except Exception: pass
+                    if mk is None or mk in _hours_archived:   # only once it's safely in #history
+                        try: await m.delete()
+                        except Exception as ex: print("finals sweep", ex)
+    except Exception as ex: print("finals sweep", ex)
 
 # ---- versioned state backups -------------------------------------------------
 # Hourly snapshot of the live clocks under a dated key in bot_state, kept ~48h.
@@ -2440,6 +2606,10 @@ async def hours_boards_loop():
     except Exception as ex: print("hours boards", ex)
     try: await refresh_leaders_board()      # crowns move as hours climb
     except Exception as ex: print("leaders board", ex)
+    try: await refresh_history_boards()     # owner-only All-Time hours + production
+    except Exception as ex: print("history boards", ex)
+    try: await sweep_finals_from_hours()    # keep #hours to the live boards only
+    except Exception as ex: print("finals sweep", ex)
 
 async def post_team_ip_monthly():
     """End-of-month manager board on ISSUED IP (a fresh post, not an edit)."""
@@ -3131,14 +3301,14 @@ def load_sched_state():
     _last_deals_daily = _sched_date(d.get("deals_daily"))
     m = d.get("monthly")
     _last_monthly = tuple(m) if isinstance(m, list) and len(m) == 2 else None
-    _hours_archived = set(x for x in (d.get("hours_archived") or []) if isinstance(x, str))
+    _hours_archived = set(x for x in (d.get("history_archived") or []) if isinstance(x, str))
 
 def save_sched_state():
     def _s(x): return x.isoformat() if x else None
     save_json(SCHED_STATE_FILE, {"daily": _s(_last_daily), "weekly": _s(_last_weekly),
                                  "builder": _s(_last_builder), "deals_daily": _s(_last_deals_daily),
                                  "monthly": list(_last_monthly) if _last_monthly else None,
-                                 "hours_archived": sorted(_hours_archived)})
+                                 "history_archived": sorted(_hours_archived)})
 
 @client.event
 async def on_ready():
@@ -3163,6 +3333,8 @@ async def on_ready():
         except Exception as e: print(_label, e)
     try: await tree.sync(guild=discord.Object(GUILD_ID))
     except Exception as e: print("tree sync", e)
+    try: await ensure_history_channel()            # owner-only #history (create or adopt)
+    except Exception as e: print("history channel", e)
     if SUPABASE_KEY:
         try: await ensure_lead_roi_message()
         except Exception as e: print("lead roi msg", e)
