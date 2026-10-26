@@ -2270,7 +2270,13 @@ def _hours_totals(dates):
     rows = [(n, h, min((cam.get(n, 0.0) / h * 100) if h else 0.0, 100.0)) for n, h in tot.items()]
     return sorted(rows, key=lambda r: (-r[1], r[0]))
 
-def _hours_board_embed(kind):
+def _hours_board_embed(kind, ap_of=None, month=None):
+    """kind: 'day' | 'week' | 'month'.
+       ap_of: optional name -> month-to-date submitted AP; shown to the RIGHT of hours on the
+              month board (💰). Display-only — never touches the hour math.
+       month: a date inside a FINISHED month -> renders that month as a permanent
+              '(Final)' archive card (title differs from the live board, so the live
+              refresh never edits it)."""
     n = now_pt(); tdy = n.date()
     if kind == "day":
         dates = [tdy]; sub = n.strftime("%A, %B %-d")
@@ -2279,10 +2285,10 @@ def _hours_board_embed(kind):
         dates = [monday + dt.timedelta(days=i) for i in range(7)]   # Mon–Sun, 24/7 hours
         sub = f"{monday.strftime('%b %-d')} – {(monday + dt.timedelta(days=6)).strftime('%b %-d')}"
     else:
-        first = tdy.replace(day=1)
+        first = (month or tdy).replace(day=1)
         nxt = dt.date(first.year + (first.month == 12), (first.month % 12) + 1, 1)
         dates = [first + dt.timedelta(days=i) for i in range((nxt - first).days)]
-        sub = n.strftime("%B %Y")
+        sub = first.strftime("%B %Y")
     rows = _hours_totals(dates)
     # Target = the SCHEDULED floor hours for the period (Mon 8:30–6 · Tue–Fri 9–6 · Sat 9–2).
     # Hours count 24/7, so early birds and night grinders can EXCEED it: 11.5/9h ⭐.
@@ -2291,28 +2297,59 @@ def _hours_board_embed(kind):
     else:                target = sum(scheduled_day_hours(d) for d in dates)
     top = rows[0][1] if rows else 0.0
     medals = ["🥇", "🥈", "🥉"]
+    show_ap = (kind == "month" and ap_of is not None)
     lines = []
     for i, (nm, h, cp) in enumerate(rows[:40]):
         tag = medals[i] if i < 3 else f"`{i + 1:>2}.`"
         camtxt = f" · 📷 {cp:.0f}%"
+        aptxt = ""
+        if show_ap:
+            try: aptxt = f" · 💰 {_fmt_money(float(ap_of(nm) or 0))}"
+            except Exception: aptxt = ""
         if target > 0:
             star = " ⭐" if h > target else ""
-            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}{camtxt}")
+            lines.append(f"{tag} **{nm}** — `{bar(min(h / target, 1.0), 10)}` **{h:.1f}/{target:g}h**{star}{camtxt}{aptxt}")
         else:                                        # Sunday day-board: no schedule, plain hours
-            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**{camtxt}")
+            lines.append(f"{tag} **{nm}** — `{bar(h / top if top else 0, 10)}` **{h:.1f}h**{camtxt}{aptxt}")
     body = f"*{sub}*\n\n" + ("\n".join(lines) if lines else "_No hours on the board yet._")
+    if month is not None:                            # permanent end-of-month record
+        title = f"📆 Hours — {sub} (Final)"
+        e = discord.Embed(title=title, description=body, color=0xD4AF37)
+        e.set_footer(text="FINAL · ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · "
+                          "📷 % on camera · 💰 submitted AP for the month · ⭐ = above & beyond")
+        return e
     e = discord.Embed(title=HOURS_BOARD_TITLES[kind], description=body, color=0xD4AF37)
-    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · 📷 % of floor time on camera · "
-                      f"⭐ = above & beyond · auto-updates · {n.strftime('%-I:%M %p')} PT")
+    apfoot = " · 💰 submitted AP this month" if show_ap else ""
+    e.set_footer(text="ALL Discord voice time (24/7, AFK not counted) vs scheduled floor hours · 📷 % of floor time on camera"
+                      f"{apfoot} · ⭐ = above & beyond · auto-updates · {n.strftime('%-I:%M %p')} PT")
     return e
+
+def _month_ap_lookup(state, prod):
+    """name -> submitted AP, resolving a Discord display name to its roster name the same
+       way the Sunday quadrant does. Returns None if nothing to show."""
+    if not prod: return None
+    def ap_of(nm):
+        canon = (match_roster(state, nm) if state else None) or nm
+        return float(prod.get(canon, 0) or 0)
+    return ap_of
 
 async def refresh_hours_boards():
     ch = client.get_channel(HOURS_CH_ID)
     if not ch: return
     ensure_today()
-    want = {HOURS_BOARD_TITLES[k]: _hours_board_embed(k) for k in ("day", "week", "month")}
+    # Month-to-date production for the 💰 chip — best effort; a Supabase hiccup simply
+    # drops the chip for one refresh and can never stop the hours boards.
+    ap_of = None
+    if SUPABASE_KEY:
+        try:
+            state = await fetch_app_state()
+            if state:
+                prod, _a, _d = await _live_prod(state, _live_month_key())
+                ap_of = _month_ap_lookup(state, prod)
+        except Exception as ex: print("hours prod chip", ex)
+    want = {HOURS_BOARD_TITLES[k]: _hours_board_embed(k, ap_of=ap_of) for k in ("day", "week", "month")}
     found = set()
-    async for m in ch.history(limit=25):
+    async for m in ch.history(limit=100):       # deep enough that monthly archives never push the live boards out of reach
         if m.author == client.user and m.embeds:
             t = m.embeds[0].title or ""
             if t in want and t not in found:
@@ -2327,6 +2364,52 @@ async def refresh_hours_boards():
                 try: await msg.pin()
                 except Exception: pass
             except Exception as ex: print("hours send", ex)
+
+# ---- end-of-month hours archive ------------------------------------------------
+# When a month finishes, its hours board would otherwise reset to the new month. Each
+# finished month is posted ONCE as a permanent "(Final)" card in #hours (with that
+# month's production), so no month is ever lost. Self-healing: any finished month found
+# in history that hasn't been archived yet gets posted, oldest first.
+_hours_archived = set()
+
+def _finished_months_in_history():
+    hist = load_json(HISTORY_FILE, {})
+    cur = _live_month_key()
+    return sorted({k[:7] for k in hist if len(k) >= 7 and k[:7] < cur})
+
+async def archive_month_hours(mkey):
+    ch = client.get_channel(HOURS_CH_ID)
+    if not ch: return False
+    y, m = int(mkey[:4]), int(mkey[5:7])
+    ap_of = None
+    if SUPABASE_KEY:
+        try:
+            state = await fetch_app_state()
+            if state:
+                prod, _a, _d = await _live_prod(state, mkey)      # finished month: tracker authoritative
+                ap_of = _month_ap_lookup(state, prod)
+        except Exception as ex: print("archive prod", mkey, ex)
+    e = _hours_board_embed("month", ap_of=ap_of, month=dt.date(y, m, 1))
+    try:
+        await ch.send(embed=e); return True
+    except Exception as ex:
+        print("archive month", mkey, ex); return False
+
+async def archive_finished_months():
+    """Post any finished month not yet archived. Runs from the scheduler after 12:10 AM so
+       the midnight freeze of the last day has landed. Persists what's been posted.
+       Returns True when nothing is left pending."""
+    global _hours_archived
+    pending = False
+    for mkey in _finished_months_in_history():
+        if mkey in _hours_archived: continue
+        if await archive_month_hours(mkey):
+            _hours_archived.add(mkey); save_sched_state()
+        else:
+            pending = True
+    return not pending
+
+_archive_checked_for = None     # live month key once every finished month is archived
 
 # ---- versioned state backups -------------------------------------------------
 # Hourly snapshot of the live clocks under a dated key in bot_state, kept ~48h.
@@ -3040,7 +3123,7 @@ def _sched_date(v):
 def load_sched_state():
     """Restore last-fire markers so a same-day restart doesn't re-post the daily close,
        the 9 PM deals total, the builder roll, or the Sunday wrap + everyone's DM cards."""
-    global _last_daily, _last_weekly, _last_monthly, _last_builder, _last_deals_daily
+    global _last_daily, _last_weekly, _last_monthly, _last_builder, _last_deals_daily, _hours_archived
     d = load_json(SCHED_STATE_FILE, {})
     _last_daily       = _sched_date(d.get("daily"))
     _last_weekly      = _sched_date(d.get("weekly"))
@@ -3048,38 +3131,38 @@ def load_sched_state():
     _last_deals_daily = _sched_date(d.get("deals_daily"))
     m = d.get("monthly")
     _last_monthly = tuple(m) if isinstance(m, list) and len(m) == 2 else None
+    _hours_archived = set(x for x in (d.get("hours_archived") or []) if isinstance(x, str))
 
 def save_sched_state():
     def _s(x): return x.isoformat() if x else None
     save_json(SCHED_STATE_FILE, {"daily": _s(_last_daily), "weekly": _s(_last_weekly),
                                  "builder": _s(_last_builder), "deals_daily": _s(_last_deals_daily),
-                                 "monthly": list(_last_monthly) if _last_monthly else None})
+                                 "monthly": list(_last_monthly) if _last_monthly else None,
+                                 "hours_archived": sorted(_hours_archived)})
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}.")
-    await cloud_pull_state()                       # restore history BEFORE anything reads it
-    load_state()
-    load_sched_state()                             # restore scheduled-post fire markers
+    try: await cloud_pull_state()                  # restore history BEFORE anything reads it
+    except Exception as e: print("cloud pull", e)
+    try: load_state()
+    except Exception as e: print("load state", e)
+    try: load_sched_state()                        # restore scheduled-post fire markers
+    except Exception as e: print("load sched", e)
     global _state_ready
     _state_ready = True                            # voice events may flow now — state is safe
     try: sync_current_voice()                      # pick up anyone already mid-session
     except Exception as e: print("voice rescan", e)
-    try: apply_recovery_final()                    # one-time Aug 3 hour restoration
-    except Exception as e: print("recovery", e)
-    try: apply_credit_andrew()                     # owner-directed: Andrew = exactly 1h today
-    except Exception as e: print("andrew credit", e)
-    try: apply_camera_backfill()                   # Aug 3 only: 100%% camera credit for today
-    except Exception as e: print("camera backfill", e)
-    try: recheck_lates()                           # heal stale late flags after schedule changes
-    except Exception as e: print("recheck lates", e)
-    await ensure_start_message()
-    await ensure_bot_avatar()
+    for _fn in (apply_recovery_final, apply_credit_andrew, apply_camera_backfill, recheck_lates):
+        try: _fn()
+        except Exception as e: print("boot step", getattr(_fn, "__name__", _fn), e)
+    # cosmetic + board setup — NONE of it may block the tracking loops from starting
+    for _label, _coro in (("start msg", ensure_start_message), ("avatar", ensure_bot_avatar),
+                          ("commands msg", ensure_commands_message), ("training msg", ensure_training_message)):
+        try: await _coro()
+        except Exception as e: print(_label, e)
     try: await tree.sync(guild=discord.Object(GUILD_ID))
     except Exception as e: print("tree sync", e)
-    await ensure_commands_message()
-    try: await ensure_training_message()
-    except Exception as e: print("training msg", e)
     if SUPABASE_KEY:
         try: await ensure_lead_roi_message()
         except Exception as e: print("lead roi msg", e)
@@ -3090,11 +3173,14 @@ async def on_ready():
             except Exception as e: print("prev team board", e)
         try: await refresh_lead_roi_board()
         except Exception as e: print("roi board", e)
-    if not scheduler.is_running(): scheduler.start()
-    if not hours_boards_loop.is_running(): hours_boards_loop.start()
-    if SUPABASE_KEY and not state_backup_loop.is_running(): state_backup_loop.start()
-    if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
-    if SUPABASE_KEY and not ip_poller.is_running(): ip_poller.start()
+    # ALWAYS start the loops last — tracking must survive any failure above
+    try:
+        if not scheduler.is_running(): scheduler.start()
+        if not hours_boards_loop.is_running(): hours_boards_loop.start()
+        if SUPABASE_KEY and not state_backup_loop.is_running(): state_backup_loop.start()
+        if SUPABASE_KEY and not wins_poller.is_running(): wins_poller.start()
+        if SUPABASE_KEY and not ip_poller.is_running(): ip_poller.start()
+    except Exception as e: print("loop start", e)
 
 @tasks.loop(seconds=30)
 async def scheduler():
@@ -3103,6 +3189,13 @@ async def scheduler():
         n = now_pt(); ensure_today()
     except Exception as e:
         print("scheduler tick", e); return
+    # End-of-month hours archive: any finished month not yet posted (after 12:10 AM so the
+    # midnight freeze of the last day is in history). Guarded + persisted: posts ONCE per month.
+    global _archive_checked_for
+    if n.time() >= dt.time(0, 10) and _archive_checked_for != _live_month_key():
+        try:
+            if await archive_finished_months(): _archive_checked_for = _live_month_key()
+        except Exception as e: print("hours archive", e)
     # 1st of the month, 10 AM PT — team IP board + trend chart + NTG quality report
     if SUPABASE_KEY and n.day == MONTHLY_REPORT_DAY and n.time() >= MONTHLY_TIME and _last_monthly != (n.year, n.month):
         _last_monthly = (n.year, n.month); save_sched_state()
